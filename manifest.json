@@ -1,0 +1,11 @@
+{
+    "display_name": "Swipe-Linked User Edit",
+    "loading_order": 10,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "Anonymous",
+    "version": "1.0.0",
+    "generate_interceptor": "swipeLinkedUserEditInterceptor"
+}

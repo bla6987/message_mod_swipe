@@ -1,0 +1,5 @@
+/* Swipe-Linked User Edit – minimal indicator */
+.mes[data-swipe-linked="1"] .mes_text {
+    border-left: 2px solid rgba(100, 200, 255, 0.35);
+    padding-left: 6px;
+}

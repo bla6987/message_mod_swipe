@@ -1,0 +1,757 @@
+(function () {
+    'use strict';
+
+    const EXTENSION_NAME = 'swipe_linked_user_edit';
+
+    // ─── State ────────────────────────────────────────────────────────────────────
+    let activeKey = null;
+    let pendingUserText = null;
+    const map = new Map(); // `${assistantMesId}:${swipeId}` -> userText
+    let observer = null;
+    let isGenerating = false;
+    let swipeDebounceTimer = null;
+    let interceptorRestore = null;
+    let lastChatId = null;
+
+    // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+    function getSettings() {
+        const ctx = globalThis.SillyTavern?.getContext?.();
+        if (!ctx) return { debug: false };
+        if (!ctx.extensionSettings) ctx.extensionSettings = {};
+        if (!ctx.extensionSettings[EXTENSION_NAME]) {
+            ctx.extensionSettings[EXTENSION_NAME] = { debug: true };
+        }
+        return ctx.extensionSettings[EXTENSION_NAME];
+    }
+
+    function log(...args) {
+        if (getSettings().debug) {
+            console.log(`[${EXTENSION_NAME}]`, ...args);
+        }
+    }
+
+    function extractSwipeText(entry) {
+        if (typeof entry === 'string') return entry;
+        if (entry == null) return null;
+        if (typeof entry === 'object') {
+            if (typeof entry.mes === 'string') return entry.mes;
+            if (typeof entry.text === 'string') return entry.text;
+            if (typeof entry.content === 'string') return entry.content;
+        }
+        return null;
+    }
+
+    function getOriginalUserTextFromMsg(userMsg) {
+        if (!userMsg) return null;
+        if (Array.isArray(userMsg.swipes) && userMsg.swipes.length) {
+            for (let i = 0; i < userMsg.swipes.length; i++) {
+                const t = extractSwipeText(userMsg.swipes[i]);
+                if (typeof t === 'string' && t.trim() !== '') return t;
+            }
+        }
+        return typeof userMsg.mes === 'string' ? userMsg.mes : null;
+    }
+
+    function ensureMappingForAssistantMesId(assistantMesId) {
+        const ctx = SillyTavern.getContext();
+        const chat = ctx.chat;
+        if (!chat) return;
+
+        const aiIdx = findChatIndexByMesId(assistantMesId);
+        if (aiIdx == null) return;
+        const aiMsg = chat[aiIdx];
+        if (!aiMsg || aiMsg.is_user || aiMsg.is_system) return;
+
+        const userIdx = getUserIndexBefore(aiIdx);
+        if (userIdx == null) return;
+        const userMsg = chat[userIdx];
+
+        // Always try to ensure swipe 0 has a mapping (original variant).
+        const originalUserText = getOriginalUserTextFromMsg(userMsg);
+        if (typeof originalUserText === 'string') {
+            const key0 = `${assistantMesId}:0`;
+            if (!map.has(key0)) {
+                map.set(key0, originalUserText);
+                log('ensureMappingForAssistantMesId – stored mapping', key0, '->', originalUserText.substring(0, 60));
+            }
+        }
+
+        // Also ensure mapping for the currently selected assistant swipe.
+        const swipeId = typeof aiMsg.swipe_id === 'number' ? aiMsg.swipe_id : 0;
+        const currentUserText = typeof userMsg?.mes === 'string' ? userMsg.mes : originalUserText;
+        if (typeof currentUserText === 'string') {
+            const key = `${assistantMesId}:${swipeId}`;
+            if (!map.has(key)) {
+                map.set(key, currentUserText);
+                log('ensureMappingForAssistantMesId – stored mapping', key, '->', currentUserText.substring(0, 60));
+            }
+        }
+    }
+
+    globalThis.swipeLinkedUserEditDebug = function () {
+        try {
+            const ctx = globalThis.SillyTavern?.getContext?.();
+            const chat = ctx?.chat;
+            const aiIdx = chat ? getLastAssistantIndexFromChat() : null;
+            const userIdx = aiIdx != null ? getUserIndexBefore(aiIdx) : null;
+            const aiEl = aiIdx != null ? getMesElByIndex(getMesIdFromChatIndex(aiIdx)) : null;
+            const userEl = userIdx != null ? getMesElByIndex(getMesIdFromChatIndex(userIdx)) : null;
+            console.log(`[${EXTENSION_NAME}] debug`, {
+                lastChatId,
+                isGenerating,
+                pendingUserText,
+                activeKey,
+                mapSize: map.size,
+                aiIdx,
+                userIdx,
+                aiMsg: aiIdx != null && chat ? chat[aiIdx] : null,
+                userMsg: userIdx != null && chat ? chat[userIdx] : null,
+                domSwipeId: aiEl ? aiEl.getAttribute('swipeid') : null,
+                aiEl,
+                userEl,
+            });
+        } catch (e) {
+            console.warn(`[${EXTENSION_NAME}] debug error`, e);
+        }
+    };
+
+    /**
+     * djb2 hash – fast 32-bit deterministic hash, returned as base-36 string.
+     */
+    function hashText(str) {
+        if (!str) return null;
+        let h = 5381;
+        for (let i = 0, len = str.length; i < len; i++) {
+            h = ((h << 5) + h + str.charCodeAt(i)) | 0;
+        }
+        return h.toString(36);
+    }
+
+    // ─── DOM Selectors (resilient) ───────────────────────────────────────────────
+
+    function getLastMesEl(isUser) {
+        const els = document.querySelectorAll('#chat .mes[is_user]');
+        if (els.length) {
+            const truthy = new Set(['true', '1']);
+            const falsy = new Set(['false', '0']);
+            for (let i = els.length - 1; i >= 0; i--) {
+                const v = (els[i].getAttribute('is_user') || '').toLowerCase();
+                if (isUser ? truthy.has(v) : falsy.has(v)) return els[i];
+            }
+        }
+
+        // Fallback for ST versions that don't expose is_user on DOM nodes.
+        try {
+            const idx = isUser ? getLastUserIndexFromChat() : getLastAssistantIndexFromChat();
+            if (idx == null) return null;
+            return getMesElByIndex(idx);
+        } catch {
+            return null;
+        }
+    }
+
+    function getMesElByIndex(index) {
+        if (index == null || index < 0) return null;
+        const selectors = [
+            `#chat .mes[mesid="${index}"]`,
+            `#chat .mes[data-mesid="${index}"]`,
+            `#chat .mes[data-message-id="${index}"]`,
+            `#chat .mes#mes${index}`,
+        ];
+        for (const sel of selectors) {
+            const el = document.querySelector(sel);
+            if (el) return el;
+        }
+
+        const normalizeId = (v) => {
+            if (v == null) return null;
+            if (typeof v === 'number') return v;
+            if (typeof v === 'string') {
+                const s = v.trim();
+                if (s === '') return null;
+                if (!Number.isNaN(Number(s)) && /^[0-9]+$/.test(s)) return Number(s);
+                const m = s.match(/([0-9]+)$/);
+                if (m && !Number.isNaN(Number(m[1]))) return Number(m[1]);
+            }
+            return null;
+        };
+
+        const els = document.querySelectorAll('#chat .mes');
+        for (let i = els.length - 1; i >= 0; i--) {
+            const el = els[i];
+            const candidates = [
+                el.getAttribute('mesid'),
+                el.getAttribute('data-mesid'),
+                el.getAttribute('data-message-id'),
+                el.dataset?.mesid,
+                el.dataset?.mesId,
+                el.dataset?.messageId,
+                el.id,
+            ];
+            for (const c of candidates) {
+                const n = normalizeId(c);
+                if (n === index) return el;
+            }
+        }
+        return null;
+    }
+
+    function getMesTextEl(mesEl) {
+        if (!mesEl) return null;
+        return mesEl.querySelector('.mes_text') || null;
+    }
+
+    function getSwipeIdForAssistantDom(mesId) {
+        const el = getMesElByIndex(mesId);
+        if (!el) return null;
+        const v = el.getAttribute('swipeid');
+        if (v == null) return null;
+        const n = Number(v);
+        return Number.isFinite(n) ? n : null;
+    }
+
+    function getLastUserMesFromDom() {
+        try {
+            const idx = getLastUserIndexFromChat();
+            if (idx != null) {
+                const userEl = getMesElByIndex(getMesIdFromChatIndex(idx));
+                const textEl = getMesTextEl(userEl);
+                if (textEl) return textEl.textContent;
+            }
+        } catch {
+            // ignore
+        }
+
+        const userEl = getLastMesEl(true);
+        const textEl = getMesTextEl(userEl);
+        if (!textEl) return null;
+        return textEl.textContent;
+    }
+
+    // ─── Chat Data Readers ───────────────────────────────────────────────────────
+
+    function getMesIdFromChatIndex(index) {
+        const chat = SillyTavern.getContext().chat;
+        const msg = chat && index != null ? chat[index] : null;
+        if (!msg) return index;
+        const mid = msg.mesid ?? msg.mesId ?? msg.message_id;
+        if (typeof mid === 'number') return mid;
+        if (typeof mid === 'string' && mid.trim() !== '' && !Number.isNaN(Number(mid))) return Number(mid);
+        return index;
+    }
+
+    function findChatIndexByMesId(mesId) {
+        const chat = SillyTavern.getContext().chat;
+        if (!chat || mesId == null) return null;
+        for (let i = chat.length - 1; i >= 0; i--) {
+            const msg = chat[i];
+            if (!msg) continue;
+            const mid = msg.mesid ?? msg.mesId ?? msg.message_id;
+            if (mid === mesId) return i;
+            if (typeof mid === 'string' && String(mesId) === mid) return i;
+        }
+        // If it looks like an index and is in range, allow it.
+        if (typeof mesId === 'number' && mesId >= 0 && mesId < chat.length) return mesId;
+        return null;
+    }
+
+    function getLastUserIndexFromChat() {
+        const chat = SillyTavern.getContext().chat;
+        if (!chat) return null;
+        for (let i = chat.length - 1; i >= 0; i--) {
+            if (chat[i]?.is_user) return i;
+        }
+        return null;
+    }
+
+    function getLastAssistantIndexFromChat() {
+        const chat = SillyTavern.getContext().chat;
+        if (!chat) return null;
+        for (let i = chat.length - 1; i >= 0; i--) {
+            const m = chat[i];
+            if (m && !m.is_user && !m.is_system) return i;
+        }
+        return null;
+    }
+
+    function getUserIndexBefore(index) {
+        const chat = SillyTavern.getContext().chat;
+        if (!chat) return null;
+        for (let i = index - 1; i >= 0; i--) {
+            if (chat[i]?.is_user) return i;
+        }
+        return null;
+    }
+
+    function getLastUserMesFromChat() {
+        const chat = SillyTavern.getContext().chat;
+        if (!chat) return null;
+        for (let i = chat.length - 1; i >= 0; i--) {
+            if (chat[i].is_user) return chat[i].mes;
+        }
+        return null;
+    }
+
+    function getLastAssistantMesFromChat() {
+        const chat = SillyTavern.getContext().chat;
+        if (!chat) return null;
+        for (let i = chat.length - 1; i >= 0; i--) {
+            if (!chat[i].is_user && !chat[i].is_system) return chat[i].mes;
+        }
+        return null;
+    }
+
+    // ─── Capture / Store ─────────────────────────────────────────────────────────
+
+    /**
+     * Capture the initial mapping for the current pair so that the "before-edit"
+     * variant is also tracked even if no generation happened while the ext was loaded.
+     */
+    function captureCurrentState() {
+        const userMes = getLastUserMesFromChat();
+        const aiIdx = getLastAssistantIndexFromChat();
+        const chat = SillyTavern.getContext().chat;
+        const aiMsg = aiIdx != null && chat ? chat[aiIdx] : null;
+        if (!userMes || !aiMsg) return;
+
+        const assistantMesId = getMesIdFromChatIndex(aiIdx);
+        const swipeId = typeof aiMsg.swipe_id === 'number' ? aiMsg.swipe_id : 0;
+        const key = `${assistantMesId}:${swipeId}`;
+        if (!map.has(key)) {
+            map.set(key, userMes);
+            activeKey = key;
+            log('captureCurrentState', key, userMes.substring(0, 60));
+        }
+
+        // Also backfill original swipe 0 mapping if possible.
+        const userIdx = getUserIndexBefore(aiIdx);
+        const userMsg = userIdx != null && chat ? chat[userIdx] : null;
+        const originalUserText = getOriginalUserTextFromMsg(userMsg);
+        if (typeof originalUserText === 'string') {
+            const key0 = `${assistantMesId}:0`;
+            if (!map.has(key0)) {
+                map.set(key0, originalUserText);
+                log('captureCurrentState', key0, originalUserText.substring(0, 60));
+            }
+        }
+    }
+
+    function updateUserBubbleForActiveKey() {
+        if (!activeKey) return;
+        const userText = map.get(activeKey);
+        if (userText == null) return;
+
+        const m = /^([0-9]+):([0-9]+)$/.exec(activeKey);
+        if (!m) return;
+        const assistantMesId = Number(m[1]);
+        const assistantChatIndex = findChatIndexByMesId(assistantMesId);
+        if (assistantChatIndex == null) {
+            log('Could not resolve assistant chat index for mesid', assistantMesId);
+            return;
+        }
+        const userIndex = getUserIndexBefore(assistantChatIndex);
+        if (userIndex == null) return;
+
+        const userEl = getMesElByIndex(getMesIdFromChatIndex(userIndex)) || getLastMesEl(true);
+        if (!userEl) {
+            log('Could not resolve user message DOM element for index', userIndex);
+            return;
+        }
+        const textEl = getMesTextEl(userEl);
+        if (!textEl) return;
+
+        if (textEl.textContent.trim() === userText.trim()) return;
+        log('Updating user bubble to:', userText.substring(0, 60));
+        textEl.textContent = userText;
+        if (userEl) {
+            userEl.setAttribute('data-swipe-linked', '1');
+        }
+    }
+
+    function refreshActiveKeyFromChat(assistantIndexOrMesId = null) {
+        const ctx = SillyTavern.getContext();
+        const chat = ctx.chat;
+        if (!chat) return;
+
+        let aiIdx = null;
+        if (assistantIndexOrMesId != null) {
+            aiIdx = findChatIndexByMesId(assistantIndexOrMesId);
+            if (aiIdx == null && typeof assistantIndexOrMesId === 'number' && assistantIndexOrMesId >= 0 && assistantIndexOrMesId < chat.length) {
+                aiIdx = assistantIndexOrMesId;
+            }
+        } else {
+            aiIdx = getLastAssistantIndexFromChat();
+        }
+        if (aiIdx == null) return;
+        const aiMsg = chat[aiIdx];
+        if (!aiMsg) return;
+        const assistantMesId = getMesIdFromChatIndex(aiIdx);
+
+        const swipeId = typeof aiMsg.swipe_id === 'number' ? aiMsg.swipe_id : 0;
+        activeKey = `${assistantMesId}:${swipeId}`;
+    }
+
+    // ─── Swipe Detection & Handling ──────────────────────────────────────────────
+
+    function handleSwipeChange() {
+        refreshActiveKeyFromChat();
+        if (!activeKey) return;
+        if (!map.has(activeKey)) {
+            log('No mapping for key', activeKey);
+            return;
+        }
+        updateUserBubbleForActiveKey();
+    }
+
+    function scheduleSwipeCheck() {
+        if (swipeDebounceTimer) clearTimeout(swipeDebounceTimer);
+        swipeDebounceTimer = setTimeout(handleSwipeChange, 80);
+    }
+
+    // ─── MutationObserver ────────────────────────────────────────────────────────
+
+    function detachObserver() {
+        if (observer) {
+            observer.disconnect();
+            observer = null;
+        }
+    }
+
+    function attachObserver() {
+        detachObserver();
+        const aiIdx = getLastAssistantIndexFromChat();
+        const aiEl = (aiIdx != null ? getMesElByIndex(getMesIdFromChatIndex(aiIdx)) : null) || getLastMesEl(false);
+        const textEl = getMesTextEl(aiEl);
+        if (!textEl) {
+            log('attachObserver: no assistant text element found');
+            return;
+        }
+        observer = new MutationObserver(() => {
+            if (!isGenerating) scheduleSwipeCheck();
+        });
+        observer.observe(textEl, {
+            characterData: true,
+            childList: true,
+            subtree: true,
+        });
+        log('Observer attached');
+    }
+
+    // ─── Cleanup ─────────────────────────────────────────────────────────────────
+
+    function clearState() {
+        activeKey = null;
+        pendingUserText = null;
+        map.clear();
+        detachObserver();
+        if (swipeDebounceTimer) {
+            clearTimeout(swipeDebounceTimer);
+            swipeDebounceTimer = null;
+        }
+        interceptorRestore = null;
+        log('State cleared');
+    }
+
+    function restoreInterceptorPatch() {
+        if (!interceptorRestore) return;
+        const { chat, originals } = interceptorRestore;
+        try {
+            if (chat && originals instanceof Map) {
+                for (const [idx, originalMsg] of originals.entries()) {
+                    if (idx != null && idx >= 0 && originalMsg) {
+                        chat[idx] = originalMsg;
+                    }
+                }
+                log('Interceptor patch restored');
+            }
+        } catch (e) {
+            console.warn(`[${EXTENSION_NAME}] restore error:`, e);
+        }
+        interceptorRestore = null;
+    }
+
+    // ─── Event Handlers ──────────────────────────────────────────────────────────
+
+    function normalizeMessageIndex(arg) {
+        if (typeof arg === 'number') return arg;
+        if (typeof arg === 'string' && arg.trim() !== '' && !Number.isNaN(Number(arg))) return Number(arg);
+        if (!arg || typeof arg !== 'object') return null;
+        if (typeof arg.messageIndex === 'number') return arg.messageIndex;
+        if (typeof arg.message_id === 'number') return arg.message_id;
+        if (typeof arg.index === 'number') return arg.index;
+        if (typeof arg.message_index === 'number') return arg.message_index;
+        if (typeof arg.mesid === 'number') return arg.mesid;
+        if (typeof arg.mesId === 'number') return arg.mesId;
+        if (typeof arg.id === 'number') return arg.id;
+        if (typeof arg.mesid === 'string' && arg.mesid.trim() !== '' && !Number.isNaN(Number(arg.mesid))) return Number(arg.mesid);
+        if (typeof arg.mesId === 'string' && arg.mesId.trim() !== '' && !Number.isNaN(Number(arg.mesId))) return Number(arg.mesId);
+        if (typeof arg.id === 'string' && arg.id.trim() !== '' && !Number.isNaN(Number(arg.id))) return Number(arg.id);
+        return null;
+    }
+
+    function onChatChanged() {
+        const ctx = SillyTavern.getContext();
+        const currentId = ctx.chatId || null;
+        if (currentId !== lastChatId) {
+            lastChatId = currentId;
+            clearState();
+        }
+        // Capture initial state for the new chat's last pair
+        requestAnimationFrame(() => {
+            captureCurrentState();
+            attachObserver();
+        });
+    }
+
+    function onGenerationAfterCommands(data) {
+        if (data && typeof data === 'object' && data.dryRun === true) return;
+        isGenerating = true;
+        // Snapshot the current last user message text (may be freshly edited)
+        pendingUserText = getLastUserMesFromDom() || getLastUserMesFromChat();
+        log('GENERATION_AFTER_COMMANDS – pending:', pendingUserText && pendingUserText.substring(0, 60));
+    }
+
+    function onGenerationStarted(data) {
+        if (data && typeof data === 'object' && data.dryRun === true) return;
+        isGenerating = true;
+        if (!pendingUserText) {
+            pendingUserText = getLastUserMesFromDom() || getLastUserMesFromChat();
+        }
+    }
+
+    function onMessageReceived(messageIndex) {
+        messageIndex = normalizeMessageIndex(messageIndex);
+        const ctx = SillyTavern.getContext();
+        const chat = ctx.chat;
+        if (!chat || messageIndex == null) return;
+
+        const chatIndex = findChatIndexByMesId(messageIndex);
+        if (chatIndex == null) return;
+
+        const msg = chat[chatIndex];
+        if (!msg || msg.is_user || msg.is_system) return;
+
+        const aiMes = msg.mes;
+        if (!aiMes || !pendingUserText) return;
+
+        const assistantMesId = getMesIdFromChatIndex(chatIndex);
+        const swipeId = typeof msg.swipe_id === 'number' ? msg.swipe_id : 0;
+        const key = `${assistantMesId}:${swipeId}`;
+        map.set(key, pendingUserText);
+        activeKey = key;
+        log('MESSAGE_RECEIVED – stored mapping', key, '->', pendingUserText.substring(0, 60));
+    }
+
+    function onCharacterMessageRendered(messageIndex) {
+        messageIndex = normalizeMessageIndex(messageIndex);
+        // Reattach observer to the newest assistant message
+        requestAnimationFrame(() => {
+            attachObserver();
+            // Ensure the currently visible swipe (usually 0) has a mapping.
+            const chatIndex = messageIndex != null ? findChatIndexByMesId(messageIndex) : null;
+            if (chatIndex != null) {
+                const assistantMesId = getMesIdFromChatIndex(chatIndex);
+                ensureMappingForAssistantMesId(assistantMesId);
+            } else {
+                const aiIdx = getLastAssistantIndexFromChat();
+                if (aiIdx != null) ensureMappingForAssistantMesId(getMesIdFromChatIndex(aiIdx));
+            }
+        });
+    }
+
+    function onGenerationEnded() {
+        isGenerating = false;
+        restoreInterceptorPatch();
+
+        if (pendingUserText) {
+            const ctx = SillyTavern.getContext();
+            const chat = ctx.chat;
+            const aiIdx = getLastAssistantIndexFromChat();
+            const aiMsg = aiIdx != null && chat ? chat[aiIdx] : null;
+            if (aiMsg) {
+                const assistantMesId = getMesIdFromChatIndex(aiIdx);
+                const swipeId = typeof aiMsg.swipe_id === 'number' ? aiMsg.swipe_id : 0;
+                const key = `${assistantMesId}:${swipeId}`;
+                map.set(key, pendingUserText);
+                activeKey = key;
+                log('GENERATION_ENDED – stored mapping', key, '->', pendingUserText.substring(0, 60));
+            }
+            pendingUserText = null;
+        }
+    }
+
+    function onMessageSwiped(messageIndex) {
+        messageIndex = normalizeMessageIndex(messageIndex);
+        log('MESSAGE_SWIPED', messageIndex);
+        requestAnimationFrame(() => {
+            if (messageIndex != null) {
+                refreshActiveKeyFromChat(messageIndex);
+            } else {
+                refreshActiveKeyFromChat();
+            }
+            log('Active key after swipe', activeKey);
+            updateUserBubbleForActiveKey();
+        });
+    }
+
+    function onMessageUpdated(messageIndex) {
+        messageIndex = normalizeMessageIndex(messageIndex);
+        if (isGenerating) return;
+        requestAnimationFrame(() => {
+            refreshActiveKeyFromChat();
+            updateUserBubbleForActiveKey();
+        });
+    }
+
+    function onMessageEdited(messageIndex) {
+        messageIndex = normalizeMessageIndex(messageIndex);
+        // Keep pending text in sync with what user actually sees.
+        // This helps in staging where ctx.chat can lag behind the UI.
+        pendingUserText = getLastUserMesFromDom() || getLastUserMesFromChat();
+        log('MESSAGE_EDITED – pending updated:', pendingUserText && pendingUserText.substring(0, 60));
+    }
+
+    function onMessageSent(messageIndex) {
+        messageIndex = normalizeMessageIndex(messageIndex);
+        // Preserve mappings so follow-up assistant generations can patch historical context.
+        // Just clear any pending text from an in-flight capture.
+        pendingUserText = null;
+    }
+
+    // ─── Generate Interceptor ────────────────────────────────────────────────────
+
+    globalThis.swipeLinkedUserEditInterceptor = async function (chat, contextSize, abort, type) {
+        if (interceptorRestore) restoreInterceptorPatch();
+        if (!activeKey || !map.has(activeKey)) return;
+
+        const mappedText = map.get(activeKey);
+        if (!mappedText) return;
+
+        const mappedTextStr = typeof mappedText === 'string' ? mappedText : String(mappedText);
+
+        const originals = new Map();
+
+        const m = /^([0-9]+):([0-9]+)$/.exec(activeKey);
+        if (!m) return;
+        const assistantMesId = Number(m[1]);
+
+        const getMesIdFromMsg = (msg) => {
+            if (!msg) return null;
+            const mid = msg.mesid ?? msg.mesId ?? msg.message_id;
+            if (typeof mid === 'number') return mid;
+            if (typeof mid === 'string' && mid.trim() !== '' && !Number.isNaN(Number(mid))) return Number(mid);
+            return null;
+        };
+
+        let assistantIdx = -1;
+        for (let i = chat.length - 1; i >= 0; i--) {
+            const mid = getMesIdFromMsg(chat[i]);
+            if (mid === assistantMesId) {
+                assistantIdx = i;
+                break;
+            }
+        }
+        if (assistantIdx === -1) return;
+
+        let userIdx = -1;
+        for (let i = assistantIdx - 1; i >= 0; i--) {
+            if (chat[i]?.is_user) {
+                userIdx = i;
+                break;
+            }
+        }
+        if (userIdx === -1) return;
+
+        const originalMsg = chat[userIdx];
+        const msg = originalMsg;
+        // If already matching, skip
+        if (msg.mes === mappedTextStr) return;
+
+        const patchedMsg = { ...msg, mes: mappedTextStr };
+
+        originals.set(userIdx, originalMsg);
+        interceptorRestore = { chat, originals };
+        chat[userIdx] = patchedMsg;
+        log('Interceptor patched user msg idx', userIdx, 'to:', mappedTextStr.substring(0, 60));
+    };
+
+    // ─── Delegated Click Handler ─────────────────────────────────────────────────
+
+    function onDocumentClick(e) {
+        const target = e.target;
+        if (!(target instanceof Element)) return;
+        const btn = target.closest('.swipe_left, .swipe_right');
+        if (!btn) return;
+        // Allow ST to process the swipe first, then check
+        requestAnimationFrame(() => scheduleSwipeCheck());
+    }
+
+    // ─── Init / Teardown ─────────────────────────────────────────────────────────
+
+    function init() {
+        const ctx = SillyTavern.getContext();
+        const { eventSource, event_types } = ctx;
+
+        if (!eventSource || !event_types) {
+            console.error(`[${EXTENSION_NAME}] SillyTavern context missing eventSource/event_types`);
+            return;
+        }
+
+        // Register event handlers
+        eventSource.on(event_types.CHAT_CHANGED, onChatChanged);
+        eventSource.on(event_types.GENERATION_AFTER_COMMANDS, onGenerationAfterCommands);
+        if (event_types.GENERATION_STARTED) {
+            eventSource.on(event_types.GENERATION_STARTED, onGenerationStarted);
+        }
+        eventSource.on(event_types.MESSAGE_RECEIVED, onMessageReceived);
+        if (event_types.MESSAGE_UPDATED) {
+            eventSource.on(event_types.MESSAGE_UPDATED, onMessageUpdated);
+        }
+        if (event_types.MESSAGE_EDITED) {
+            eventSource.on(event_types.MESSAGE_EDITED, onMessageEdited);
+        }
+        eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, onCharacterMessageRendered);
+        eventSource.on(event_types.GENERATION_ENDED, onGenerationEnded);
+        eventSource.on(event_types.GENERATION_STOPPED, onGenerationEnded);
+        eventSource.on(event_types.MESSAGE_SENT, onMessageSent);
+        if (event_types.MESSAGE_SWIPED) {
+            eventSource.on(event_types.MESSAGE_SWIPED, onMessageSwiped);
+        }
+
+        // Delegated click handler for swipe buttons
+        document.addEventListener('click', onDocumentClick);
+
+        // Initial capture for already-loaded chat
+        requestAnimationFrame(() => {
+            lastChatId = ctx.chatId || null;
+            captureCurrentState();
+            attachObserver();
+        });
+
+        log('Extension initialized');
+    }
+
+    function boot(retries = 0) {
+        const maxRetries = 100;
+        if (!globalThis.SillyTavern?.getContext) {
+            if (retries < maxRetries) return setTimeout(() => boot(retries + 1), 100);
+            console.error(`[${EXTENSION_NAME}] SillyTavern not available`);
+            return;
+        }
+        const ctx = globalThis.SillyTavern.getContext();
+        if (!ctx?.eventSource || !ctx?.event_types) {
+            if (retries < maxRetries) return setTimeout(() => boot(retries + 1), 100);
+            console.error(`[${EXTENSION_NAME}] SillyTavern context missing eventSource/event_types`);
+            return;
+        }
+        init();
+    }
+
+    // Run init once DOM is ready
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', boot);
+    } else {
+        boot();
+    }
+})();
