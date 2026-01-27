@@ -14,23 +14,16 @@
     let lastChatId = null;
     let currentAssistantMesId = null; // Track current assistant for map cleanup
     let hasMessageSwipedEvent = false; // True if MESSAGE_SWIPED event is available
+    let generationKey = null; // Key captured at generation start for interceptor use
     const MAX_MAP_ENTRIES = 100; // Safety limit for map size
 
     /**
-     * Cleanup map entries for old assistant messages and enforce size limit.
+     * Cleanup map entries and enforce size limit.
      * Called when storing a new mapping after generation.
+     * Only enforces max size limit (FIFO eviction) - don't delete entries based on
+     * assistant change since user may swipe back to earlier messages.
      */
     function cleanupMapEntries(newAssistantMesId) {
-        // If assistant changed, clear entries for the old assistant
-        if (currentAssistantMesId !== null && currentAssistantMesId !== newAssistantMesId) {
-            const prefix = `${currentAssistantMesId}:`;
-            for (const key of [...map.keys()]) {
-                if (key.startsWith(prefix)) {
-                    map.delete(key);
-                }
-            }
-            log('Cleared map entries for old assistant', currentAssistantMesId);
-        }
         currentAssistantMesId = newAssistantMesId;
 
         // Enforce max size limit (FIFO eviction)
@@ -244,6 +237,23 @@
         // The existence check happens at call sites (map.has(key)).
         // Previous logic incorrectly conflated user message swipes with assistant swipe mappings.
         return true;
+    }
+
+    /**
+     * Get the swipe ID from a message object.
+     * Prefer swipes array length as it's updated before swipe_id in some cases
+     * (during swipe creation, the array gets the new entry before swipe_id increments).
+     */
+    function getSwipeIdFromMsg(msg) {
+        // Prefer swipes array length as it's updated before swipe_id in some cases
+        if (Array.isArray(msg?.swipes) && msg.swipes.length > 0) {
+            return msg.swipes.length - 1;
+        }
+        // Fall back to swipe_id property
+        if (typeof msg?.swipe_id === 'number') {
+            return msg.swipe_id;
+        }
+        return 0;
     }
 
     function getLastUserMesFromDom() {
@@ -530,6 +540,9 @@
     }
 
     function onChatChanged() {
+        // Restore any pending interceptor patch before clearing state
+        restoreInterceptorPatch();
+
         const ctx = SillyTavern.getContext();
         const currentId = ctx.chatId || null;
         if (currentId !== lastChatId) {
@@ -548,7 +561,20 @@
         isGenerating = true;
         // Snapshot the current last user message text (may be freshly edited)
         pendingUserText = getLastUserMesFromDom() || getLastUserMesFromChat();
-        log('GENERATION_AFTER_COMMANDS – pending:', pendingUserText && pendingUserText.substring(0, 60));
+
+        // Capture the key NOW before any state changes during generation
+        refreshActiveKeyFromChat();
+        generationKey = activeKey;
+
+        log('GENERATION_AFTER_COMMANDS – pending:', pendingUserText && pendingUserText.substring(0, 60), 'key:', generationKey);
+
+        // Safety: restore after timeout if generation takes too long or events don't fire
+        setTimeout(() => {
+            if (interceptorRestore) {
+                log('Safety timeout: restoring interceptor patch');
+                restoreInterceptorPatch();
+            }
+        }, 60000); // 60 second safety
     }
 
     function onGenerationStarted(data) {
@@ -578,7 +604,7 @@
         // Clean up old entries before storing new mapping
         cleanupMapEntries(assistantMesId);
 
-        const swipeId = typeof msg.swipe_id === 'number' ? msg.swipe_id : 0;
+        const swipeId = getSwipeIdFromMsg(msg);
         const key = `${assistantMesId}:${swipeId}`;
         map.set(key, pendingUserText);
         activeKey = key;
@@ -604,6 +630,7 @@
 
     function onGenerationEnded() {
         isGenerating = false;
+        generationKey = null; // Clear the generation-specific key
         restoreInterceptorPatch();
 
         if (pendingUserText) {
@@ -616,7 +643,7 @@
                 // Clean up old entries before storing new mapping
                 cleanupMapEntries(assistantMesId);
 
-                const swipeId = typeof aiMsg.swipe_id === 'number' ? aiMsg.swipe_id : 0;
+                const swipeId = getSwipeIdFromMsg(aiMsg);
                 const key = `${assistantMesId}:${swipeId}`;
                 map.set(key, pendingUserText);
                 activeKey = key;
@@ -670,18 +697,17 @@
         // Restore any previous patch first
         if (interceptorRestore) restoreInterceptorPatch();
 
-        // Synchronously refresh activeKey from current chat state to avoid stale key issues
-        // when generation starts immediately after a swipe click
-        refreshActiveKeyFromChat();
+        // Use the key captured at generation start, not current state
+        // This avoids race conditions where swipe_id may have changed
+        const keyToUse = generationKey || activeKey;
+        if (!keyToUse || !map.has(keyToUse)) return;
 
-        if (!activeKey || !map.has(activeKey)) return;
-
-        const mappedText = map.get(activeKey);
+        const mappedText = map.get(keyToUse);
         if (!mappedText) return;
 
         const mappedTextStr = typeof mappedText === 'string' ? mappedText : String(mappedText);
 
-        const m = /^([0-9]+):([0-9]+)$/.exec(activeKey);
+        const m = /^([0-9]+):([0-9]+)$/.exec(keyToUse);
         if (!m) return;
         const assistantMesId = Number(m[1]);
 
@@ -724,7 +750,7 @@
         // This is safer because if ST modifies other properties during generation,
         // we won't lose those changes when we restore.
         msg.mes = mappedTextStr;
-        log('Interceptor patched user msg idx', userIdx, 'to:', mappedTextStr.substring(0, 60));
+        log('Interceptor patched user msg idx', userIdx, 'with key', keyToUse, 'to:', mappedTextStr.substring(0, 60));
     };
 
     // ─── Delegated Click Handler ─────────────────────────────────────────────────
