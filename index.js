@@ -12,6 +12,34 @@
     let swipeDebounceTimer = null;
     let interceptorRestore = null;
     let lastChatId = null;
+    let currentAssistantMesId = null; // Track current assistant for map cleanup
+    let hasMessageSwipedEvent = false; // True if MESSAGE_SWIPED event is available
+    const MAX_MAP_ENTRIES = 100; // Safety limit for map size
+
+    /**
+     * Cleanup map entries for old assistant messages and enforce size limit.
+     * Called when storing a new mapping after generation.
+     */
+    function cleanupMapEntries(newAssistantMesId) {
+        // If assistant changed, clear entries for the old assistant
+        if (currentAssistantMesId !== null && currentAssistantMesId !== newAssistantMesId) {
+            const prefix = `${currentAssistantMesId}:`;
+            for (const key of [...map.keys()]) {
+                if (key.startsWith(prefix)) {
+                    map.delete(key);
+                }
+            }
+            log('Cleared map entries for old assistant', currentAssistantMesId);
+        }
+        currentAssistantMesId = newAssistantMesId;
+
+        // Enforce max size limit (FIFO eviction)
+        if (map.size > MAX_MAP_ENTRIES) {
+            const keysToDelete = [...map.keys()].slice(0, map.size - MAX_MAP_ENTRIES);
+            keysToDelete.forEach(k => map.delete(k));
+            log('Evicted', keysToDelete.length, 'old map entries');
+        }
+    }
 
     // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -20,7 +48,7 @@
         if (!ctx) return { debug: false };
         if (!ctx.extensionSettings) ctx.extensionSettings = {};
         if (!ctx.extensionSettings[EXTENSION_NAME]) {
-            ctx.extensionSettings[EXTENSION_NAME] = { debug: true };
+            ctx.extensionSettings[EXTENSION_NAME] = { debug: false };
         }
         return ctx.extensionSettings[EXTENSION_NAME];
     }
@@ -211,11 +239,11 @@
         return 0;
     }
 
-    function shouldBackfillSwipeMapping(userMsg, swipeId) {
-        if (swipeId === 0) return true;
-        if (!userMsg) return false;
-        if (!Array.isArray(userMsg.swipes) || userMsg.swipes.length === 0) return true;
-        return false;
+    function shouldBackfillSwipeMapping(_userMsg, _swipeId) {
+        // Always allow backfill for any swipeId we don't have a mapping for.
+        // The existence check happens at call sites (map.has(key)).
+        // Previous logic incorrectly conflated user message swipes with assistant swipe mappings.
+        return true;
     }
 
     function getLastUserMesFromDom() {
@@ -439,7 +467,8 @@
             return;
         }
         observer = new MutationObserver(() => {
-            if (!isGenerating) scheduleSwipeCheck();
+            // Only use MutationObserver for swipe detection if MESSAGE_SWIPED event is unavailable
+            if (!isGenerating && !hasMessageSwipedEvent) scheduleSwipeCheck();
         });
         observer.observe(textEl, {
             characterData: true,
@@ -455,6 +484,7 @@
         activeKey = null;
         pendingUserText = null;
         map.clear();
+        currentAssistantMesId = null;
         detachObserver();
         if (swipeDebounceTimer) {
             clearTimeout(swipeDebounceTimer);
@@ -466,14 +496,12 @@
 
     function restoreInterceptorPatch() {
         if (!interceptorRestore) return;
-        const { chat, originals } = interceptorRestore;
+        const { chat, userIdx, originalMes } = interceptorRestore;
         try {
-            if (chat && originals instanceof Map) {
-                for (const [idx, originalMsg] of originals.entries()) {
-                    if (idx != null && idx >= 0 && originalMsg) {
-                        chat[idx] = originalMsg;
-                    }
-                }
+            // Only restore the mes property, not the entire object.
+            // This is safer as it avoids overwriting other properties ST may have modified.
+            if (chat && userIdx != null && userIdx >= 0 && chat[userIdx] && originalMes !== undefined) {
+                chat[userIdx].mes = originalMes;
                 log('Interceptor patch restored');
             }
         } catch (e) {
@@ -547,6 +575,9 @@
         if (!aiMes || !pendingUserText) return;
 
         const assistantMesId = getMesIdFromChatIndex(chatIndex);
+        // Clean up old entries before storing new mapping
+        cleanupMapEntries(assistantMesId);
+
         const swipeId = typeof msg.swipe_id === 'number' ? msg.swipe_id : 0;
         const key = `${assistantMesId}:${swipeId}`;
         map.set(key, pendingUserText);
@@ -582,6 +613,9 @@
             const aiMsg = aiIdx != null && chat ? chat[aiIdx] : null;
             if (aiMsg) {
                 const assistantMesId = getMesIdFromChatIndex(aiIdx);
+                // Clean up old entries before storing new mapping
+                cleanupMapEntries(assistantMesId);
+
                 const swipeId = typeof aiMsg.swipe_id === 'number' ? aiMsg.swipe_id : 0;
                 const key = `${assistantMesId}:${swipeId}`;
                 map.set(key, pendingUserText);
@@ -632,16 +666,20 @@
 
     // ─── Generate Interceptor ────────────────────────────────────────────────────
 
-    globalThis.swipeLinkedUserEditInterceptor = async function (chat, contextSize, abort, type) {
+    globalThis.swipeLinkedUserEditInterceptor = async function (chat, _contextSize, _abort, _type) {
+        // Restore any previous patch first
         if (interceptorRestore) restoreInterceptorPatch();
+
+        // Synchronously refresh activeKey from current chat state to avoid stale key issues
+        // when generation starts immediately after a swipe click
+        refreshActiveKeyFromChat();
+
         if (!activeKey || !map.has(activeKey)) return;
 
         const mappedText = map.get(activeKey);
         if (!mappedText) return;
 
         const mappedTextStr = typeof mappedText === 'string' ? mappedText : String(mappedText);
-
-        const originals = new Map();
 
         const m = /^([0-9]+):([0-9]+)$/.exec(activeKey);
         if (!m) return;
@@ -674,22 +712,27 @@
         }
         if (userIdx === -1) return;
 
-        const originalMsg = chat[userIdx];
-        const msg = originalMsg;
+        const msg = chat[userIdx];
         // If already matching, skip
         if (msg.mes === mappedTextStr) return;
 
-        const patchedMsg = { ...msg, mes: mappedTextStr };
+        // Store only the original mes value for restore (safer than storing whole object)
+        const originalMes = msg.mes;
+        interceptorRestore = { chat, userIdx, originalMes };
 
-        originals.set(userIdx, originalMsg);
-        interceptorRestore = { chat, originals };
-        chat[userIdx] = patchedMsg;
+        // Mutate the mes property directly instead of replacing the object.
+        // This is safer because if ST modifies other properties during generation,
+        // we won't lose those changes when we restore.
+        msg.mes = mappedTextStr;
         log('Interceptor patched user msg idx', userIdx, 'to:', mappedTextStr.substring(0, 60));
     };
 
     // ─── Delegated Click Handler ─────────────────────────────────────────────────
 
     function onDocumentClick(e) {
+        // If MESSAGE_SWIPED event is available, let it handle swipe detection
+        if (hasMessageSwipedEvent) return;
+
         const target = e.target;
         if (!(target instanceof Element)) return;
         const btn = target.closest('.swipe_left, .swipe_right');
@@ -727,6 +770,7 @@
         eventSource.on(event_types.GENERATION_STOPPED, onGenerationEnded);
         eventSource.on(event_types.MESSAGE_SENT, onMessageSent);
         if (event_types.MESSAGE_SWIPED) {
+            hasMessageSwipedEvent = true;
             eventSource.on(event_types.MESSAGE_SWIPED, onMessageSwiped);
         }
 
