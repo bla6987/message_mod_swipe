@@ -78,9 +78,9 @@
         }
 
         // Also ensure mapping for the currently selected assistant swipe.
-        const swipeId = typeof aiMsg.swipe_id === 'number' ? aiMsg.swipe_id : 0;
+        const swipeId = resolveSwipeId(assistantMesId, aiMsg);
         const currentUserText = typeof userMsg?.mes === 'string' ? userMsg.mes : originalUserText;
-        if (typeof currentUserText === 'string') {
+        if (typeof currentUserText === 'string' && shouldBackfillSwipeMapping(userMsg, swipeId)) {
             const key = `${assistantMesId}:${swipeId}`;
             if (!map.has(key)) {
                 map.set(key, currentUserText);
@@ -145,7 +145,7 @@
         try {
             const idx = isUser ? getLastUserIndexFromChat() : getLastAssistantIndexFromChat();
             if (idx == null) return null;
-            return getMesElByIndex(idx);
+            return getMesElByIndex(getMesIdFromChatIndex(idx));
         } catch {
             return null;
         }
@@ -209,6 +209,25 @@
         if (v == null) return null;
         const n = Number(v);
         return Number.isFinite(n) ? n : null;
+    }
+
+    function resolveSwipeId(assistantMesId, aiMsg) {
+        const domSwipeId = getSwipeIdForAssistantDom(assistantMesId);
+        const msgSwipeId = typeof aiMsg?.swipe_id === 'number' ? aiMsg.swipe_id : null;
+        if (Number.isFinite(domSwipeId) && Number.isFinite(msgSwipeId) && domSwipeId !== msgSwipeId) {
+            log('resolveSwipeId: DOM swipeid differs from chat swipe_id; using chat value', domSwipeId, msgSwipeId);
+            return msgSwipeId;
+        }
+        if (Number.isFinite(msgSwipeId)) return msgSwipeId;
+        if (Number.isFinite(domSwipeId)) return domSwipeId;
+        return 0;
+    }
+
+    function shouldBackfillSwipeMapping(userMsg, swipeId) {
+        if (swipeId === 0) return true;
+        if (!userMsg) return false;
+        if (!Array.isArray(userMsg.swipes) || userMsg.swipes.length === 0) return true;
+        return false;
     }
 
     function getLastUserMesFromDom() {
@@ -315,18 +334,21 @@
         const aiMsg = aiIdx != null && chat ? chat[aiIdx] : null;
         if (!userMes || !aiMsg) return;
 
+        const userIdx = getUserIndexBefore(aiIdx);
+        const userMsg = userIdx != null && chat ? chat[userIdx] : null;
+
         const assistantMesId = getMesIdFromChatIndex(aiIdx);
-        const swipeId = typeof aiMsg.swipe_id === 'number' ? aiMsg.swipe_id : 0;
-        const key = `${assistantMesId}:${swipeId}`;
-        if (!map.has(key)) {
-            map.set(key, userMes);
-            activeKey = key;
-            log('captureCurrentState', key, userMes.substring(0, 60));
+        const swipeId = resolveSwipeId(assistantMesId, aiMsg);
+        if (shouldBackfillSwipeMapping(userMsg, swipeId)) {
+            const key = `${assistantMesId}:${swipeId}`;
+            if (!map.has(key)) {
+                map.set(key, userMes);
+                activeKey = key;
+                log('captureCurrentState', key, userMes.substring(0, 60));
+            }
         }
 
         // Also backfill original swipe 0 mapping if possible.
-        const userIdx = getUserIndexBefore(aiIdx);
-        const userMsg = userIdx != null && chat ? chat[userIdx] : null;
         const originalUserText = getOriginalUserTextFromMsg(userMsg);
         if (typeof originalUserText === 'string') {
             const key0 = `${assistantMesId}:0`;
@@ -388,7 +410,7 @@
         if (!aiMsg) return;
         const assistantMesId = getMesIdFromChatIndex(aiIdx);
 
-        const swipeId = typeof aiMsg.swipe_id === 'number' ? aiMsg.swipe_id : 0;
+        const swipeId = resolveSwipeId(assistantMesId, aiMsg);
         activeKey = `${assistantMesId}:${swipeId}`;
     }
 

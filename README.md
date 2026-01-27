@@ -52,17 +52,16 @@ Debug logs are prefixed with `[swipe_linked_user_edit]`.
 
 ## Known Limitations
 
-- **Only tracks the most recent user+assistant pair.** Once you send the next message, all mappings are discarded.
+- **Only tracks the swipes for the most recent assistant message.** Older messages are not actively managed (SillyTavern only exposes swipe controls for the latest reply).
 - **Pre-existing variants** (created before the extension loaded or before the current session) will not have a mapping; the user bubble is left unchanged when swiping to them.
 - **Formatting is lost** in the swapped user bubble because `textContent` is used for safe DOM updates. The underlying chat data is not modified.
-- **No persistence.** Mappings live in memory only. Reloading the page loses all associations.
-- **Hash collisions** (djb2 32-bit) are theoretically possible but extremely unlikely for typical message lengths.
+- **No persistence.** Mappings live in memory only. Reloading the page or switching chats loses all associations.
 - **Does not create branches or checkpoints.** This is intentionally lightweight and ephemeral.
 
 ## How It Works (internals)
 
 1. `GENERATION_AFTER_COMMANDS` — snapshots the current last user message text.
-2. `MESSAGE_RECEIVED` — stores `hash(aiText) → userText` in a Map.
+2. `MESSAGE_RECEIVED` — stores `assistantMesId:swipeId → userText` in a Map.
 3. Swipe detection (MutationObserver on assistant `.mes_text` + delegated click on `.swipe_left`/`.swipe_right`) triggers a lookup and DOM update.
 4. `generate_interceptor` — ephemerally patches the last user message in the outgoing prompt array (clones only that one message object; restores on `GENERATION_ENDED`).
-5. `MESSAGE_SENT` / `CHAT_CHANGED` — clears all state.
+5. `CHAT_CHANGED` — clears all state. `MESSAGE_SENT` only clears the pending snapshot.
