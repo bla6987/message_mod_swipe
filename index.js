@@ -116,18 +116,6 @@
         }
     };
 
-    /**
-     * djb2 hash – fast 32-bit deterministic hash, returned as base-36 string.
-     */
-    function hashText(str) {
-        if (!str) return null;
-        let h = 5381;
-        for (let i = 0, len = str.length; i < len; i++) {
-            h = ((h << 5) + h + str.charCodeAt(i)) | 0;
-        }
-        return h.toString(36);
-    }
-
     // ─── DOM Selectors (resilient) ───────────────────────────────────────────────
 
     function getLastMesEl(isUser) {
@@ -307,7 +295,7 @@
         const chat = SillyTavern.getContext().chat;
         if (!chat) return null;
         for (let i = chat.length - 1; i >= 0; i--) {
-            if (chat[i].is_user) return chat[i].mes;
+            if (chat[i]?.is_user) return chat[i].mes;
         }
         return null;
     }
@@ -316,7 +304,8 @@
         const chat = SillyTavern.getContext().chat;
         if (!chat) return null;
         for (let i = chat.length - 1; i >= 0; i--) {
-            if (!chat[i].is_user && !chat[i].is_system) return chat[i].mes;
+            const m = chat[i];
+            if (m && !m.is_user && !m.is_system) return m.mes;
         }
         return null;
     }
