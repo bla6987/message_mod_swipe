@@ -301,6 +301,19 @@
         return null;
     }
 
+    function mesIdExistsInChat(mesId) {
+        const chat = SillyTavern.getContext().chat;
+        if (!chat || mesId == null) return false;
+        for (let i = 0; i < chat.length; i++) {
+            const msg = chat[i];
+            if (!msg) continue;
+            const mid = msg.mesid ?? msg.mesId ?? msg.message_id;
+            if (mid === mesId) return true;
+            if (typeof mid === 'string' && String(mesId) === mid) return true;
+        }
+        return false;
+    }
+
     function getLastUserIndexFromChat() {
         const chat = SillyTavern.getContext().chat;
         if (!chat) return null;
@@ -684,6 +697,53 @@
         log('MESSAGE_EDITED – pending updated:', pendingUserText && pendingUserText.substring(0, 60));
     }
 
+    function onMessageDeleted(_chatLength) {
+        // MESSAGE_DELETED only provides chat.length, not which message was deleted.
+        // Scan all map keys and remove any whose mesId no longer exists in chat.
+
+        if (map.size === 0) return;
+
+        // Extract unique mesIds from map keys (format: "mesId:swipeId")
+        const trackedMesIds = new Set();
+        for (const key of map.keys()) {
+            const colonIdx = key.indexOf(':');
+            if (colonIdx > 0) {
+                const mesId = Number(key.substring(0, colonIdx));
+                if (Number.isFinite(mesId)) {
+                    trackedMesIds.add(mesId);
+                }
+            }
+        }
+
+        // Find which mesIds no longer exist
+        const orphanedMesIds = [];
+        for (const mesId of trackedMesIds) {
+            if (!mesIdExistsInChat(mesId)) {
+                orphanedMesIds.push(mesId);
+            }
+        }
+
+        if (orphanedMesIds.length === 0) return;
+
+        // Remove all mappings for orphaned mesIds
+        let removed = 0;
+        for (const mesId of orphanedMesIds) {
+            const prefix = `${mesId}:`;
+            for (const key of [...map.keys()]) {
+                if (key.startsWith(prefix)) {
+                    map.delete(key);
+                    removed++;
+                }
+            }
+            // Clear activeKey if it referenced a deleted message
+            if (activeKey && activeKey.startsWith(prefix)) {
+                activeKey = null;
+            }
+        }
+
+        log('MESSAGE_DELETED – removed', removed, 'mappings for', orphanedMesIds.length, 'deleted messages');
+    }
+
     function onMessageSent(messageIndex) {
         messageIndex = normalizeMessageIndex(messageIndex);
         // Preserve mappings so follow-up assistant generations can patch historical context.
@@ -798,6 +858,9 @@
         if (event_types.MESSAGE_SWIPED) {
             hasMessageSwipedEvent = true;
             eventSource.on(event_types.MESSAGE_SWIPED, onMessageSwiped);
+        }
+        if (event_types.MESSAGE_DELETED) {
+            eventSource.on(event_types.MESSAGE_DELETED, onMessageDeleted);
         }
 
         // Delegated click handler for swipe buttons
