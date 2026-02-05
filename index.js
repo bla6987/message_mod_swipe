@@ -399,36 +399,101 @@
         }
     }
 
+    function clearAnySwipeLinkedHighlight() {
+        const highlighted = document.querySelectorAll('#chat .mes[data-swipe-linked="1"]');
+        highlighted.forEach((el) => {
+            el.removeAttribute('data-swipe-linked');
+        });
+    }
+
+    function clearUserBubbleHighlightForAssistant(assistantMesId) {
+        if (assistantMesId == null) {
+            clearAnySwipeLinkedHighlight();
+            return;
+        }
+
+        const assistantChatIndex = findChatIndexByMesId(assistantMesId);
+        if (assistantChatIndex == null) {
+            clearAnySwipeLinkedHighlight();
+            return;
+        }
+
+        const userIndex = getUserIndexBefore(assistantChatIndex);
+        if (userIndex == null) {
+            clearAnySwipeLinkedHighlight();
+            return;
+        }
+
+        const userEl = getMesElByIndex(getMesIdFromChatIndex(userIndex)) || getLastMesEl(true);
+        if (!userEl) {
+            clearAnySwipeLinkedHighlight();
+            return;
+        }
+
+        userEl.removeAttribute('data-swipe-linked');
+    }
+
+    function clearUserBubbleHighlightForActiveKey() {
+        if (!activeKey) {
+            clearAnySwipeLinkedHighlight();
+            return;
+        }
+
+        const m = /^([0-9]+):([0-9]+)$/.exec(activeKey);
+        if (!m) {
+            clearAnySwipeLinkedHighlight();
+            return;
+        }
+
+        clearUserBubbleHighlightForAssistant(Number(m[1]));
+    }
+
     function updateUserBubbleForActiveKey() {
         if (!activeKey) return;
         const userText = map.get(activeKey);
-        if (userText == null) return;
+        if (userText == null) {
+            clearUserBubbleHighlightForActiveKey();
+            return;
+        }
 
         const m = /^([0-9]+):([0-9]+)$/.exec(activeKey);
-        if (!m) return;
+        if (!m) {
+            clearAnySwipeLinkedHighlight();
+            return;
+        }
         const assistantMesId = Number(m[1]);
         const assistantChatIndex = findChatIndexByMesId(assistantMesId);
         if (assistantChatIndex == null) {
             log('Could not resolve assistant chat index for mesid', assistantMesId);
+            clearAnySwipeLinkedHighlight();
             return;
         }
         const userIndex = getUserIndexBefore(assistantChatIndex);
-        if (userIndex == null) return;
+        if (userIndex == null) {
+            clearAnySwipeLinkedHighlight();
+            return;
+        }
 
         const userEl = getMesElByIndex(getMesIdFromChatIndex(userIndex)) || getLastMesEl(true);
         if (!userEl) {
             log('Could not resolve user message DOM element for index', userIndex);
+            clearAnySwipeLinkedHighlight();
             return;
         }
         const textEl = getMesTextEl(userEl);
-        if (!textEl) return;
+        if (!textEl) {
+            clearAnySwipeLinkedHighlight();
+            return;
+        }
 
-        if (textEl.textContent.trim() === userText.trim()) return;
+        if (textEl.textContent.trim() === userText.trim()) {
+            userEl.setAttribute('data-swipe-linked', '1');
+            return;
+        }
+
         log('Updating user bubble to:', userText.substring(0, 60));
         textEl.textContent = userText;
-        if (userEl) {
-            userEl.setAttribute('data-swipe-linked', '1');
-        }
+        userEl.setAttribute('data-swipe-linked', '1');
     }
 
     function refreshActiveKeyFromChat(assistantIndexOrMesId = null) {
@@ -458,9 +523,13 @@
 
     function handleSwipeChange() {
         refreshActiveKeyFromChat();
-        if (!activeKey) return;
+        if (!activeKey) {
+            clearAnySwipeLinkedHighlight();
+            return;
+        }
         if (!map.has(activeKey)) {
             log('No mapping for key', activeKey);
+            clearUserBubbleHighlightForActiveKey();
             return;
         }
         updateUserBubbleForActiveKey();
@@ -504,6 +573,7 @@
     // ─── Cleanup ─────────────────────────────────────────────────────────────────
 
     function clearState() {
+        clearAnySwipeLinkedHighlight();
         activeKey = null;
         pendingUserText = null;
         map.clear();
@@ -676,6 +746,10 @@
                 refreshActiveKeyFromChat();
             }
             log('Active key after swipe', activeKey);
+            if (!activeKey || !map.has(activeKey)) {
+                clearUserBubbleHighlightForActiveKey();
+                return;
+            }
             updateUserBubbleForActiveKey();
         });
     }
@@ -685,6 +759,10 @@
         if (isGenerating) return;
         requestAnimationFrame(() => {
             refreshActiveKeyFromChat();
+            if (!activeKey || !map.has(activeKey)) {
+                clearUserBubbleHighlightForActiveKey();
+                return;
+            }
             updateUserBubbleForActiveKey();
         });
     }
@@ -727,6 +805,7 @@
 
         // Remove all mappings for orphaned mesIds
         let removed = 0;
+        let activeKeyCleared = false;
         for (const mesId of orphanedMesIds) {
             const prefix = `${mesId}:`;
             for (const key of [...map.keys()]) {
@@ -738,7 +817,12 @@
             // Clear activeKey if it referenced a deleted message
             if (activeKey && activeKey.startsWith(prefix)) {
                 activeKey = null;
+                activeKeyCleared = true;
             }
+        }
+
+        if (activeKeyCleared) {
+            clearAnySwipeLinkedHighlight();
         }
 
         log('MESSAGE_DELETED – removed', removed, 'mappings for', orphanedMesIds.length, 'deleted messages');
@@ -777,6 +861,10 @@
 
         // 3. Refresh active key (MESSAGE_SWIPED will also fire, but be safe)
         refreshActiveKeyFromChat();
+        if (!activeKey || !map.has(activeKey)) {
+            clearUserBubbleHighlightForAssistant(assistantMesId);
+            return;
+        }
         updateUserBubbleForActiveKey();
     }
 
