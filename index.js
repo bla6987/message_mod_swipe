@@ -744,6 +744,42 @@
         log('MESSAGE_DELETED – removed', removed, 'mappings for', orphanedMesIds.length, 'deleted messages');
     }
 
+    function onMessageSwipeDeleted(data) {
+        if (!data || typeof data !== 'object') return;
+        const { messageId, swipeId } = data;
+        if (typeof messageId !== 'number' || typeof swipeId !== 'number') return;
+
+        const assistantMesId = getMesIdFromChatIndex(messageId);
+        if (assistantMesId == null) return;
+
+        // 1. Delete the mapping for the removed swipe
+        const deletedKey = `${assistantMesId}:${swipeId}`;
+        map.delete(deletedKey);
+
+        // 2. Shift all mappings above the deleted index down by 1
+        const toRename = [];
+        for (const key of map.keys()) {
+            const m = /^(\d+):(\d+)$/.exec(key);
+            if (!m) continue;
+            if (Number(m[1]) === assistantMesId && Number(m[2]) > swipeId) {
+                toRename.push({ oldKey: key, oldIdx: Number(m[2]) });
+            }
+        }
+        // Sort descending so we don't collide during rename
+        toRename.sort((a, b) => b.oldIdx - a.oldIdx);
+        for (const { oldKey, oldIdx } of toRename) {
+            const value = map.get(oldKey);
+            map.delete(oldKey);
+            map.set(`${assistantMesId}:${oldIdx - 1}`, value);
+        }
+
+        log('MESSAGE_SWIPE_DELETED – shifted', toRename.length, 'mappings, deleted key', deletedKey);
+
+        // 3. Refresh active key (MESSAGE_SWIPED will also fire, but be safe)
+        refreshActiveKeyFromChat();
+        updateUserBubbleForActiveKey();
+    }
+
     function onMessageSent(messageIndex) {
         messageIndex = normalizeMessageIndex(messageIndex);
         // Preserve mappings so follow-up assistant generations can patch historical context.
@@ -861,6 +897,9 @@
         }
         if (event_types.MESSAGE_DELETED) {
             eventSource.on(event_types.MESSAGE_DELETED, onMessageDeleted);
+        }
+        if (event_types.MESSAGE_SWIPE_DELETED) {
+            eventSource.on(event_types.MESSAGE_SWIPE_DELETED, onMessageSwipeDeleted);
         }
 
         // Delegated click handler for swipe buttons
