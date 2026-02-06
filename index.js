@@ -486,6 +486,19 @@
             return;
         }
 
+        // Compare stored text against the canonical user message in chat data.
+        // Only highlight if the text was actually modified for this swipe variant.
+        const chat = SillyTavern.getContext().chat;
+        const originalUserText = chat && chat[userIndex] ? chat[userIndex].mes : null;
+        if (originalUserText != null && userText.trim() === originalUserText.trim()) {
+            // Text wasn't modified – restore DOM if needed but don't highlight
+            if (textEl.textContent.trim() !== originalUserText.trim()) {
+                textEl.textContent = originalUserText;
+            }
+            userEl.removeAttribute('data-swipe-linked');
+            return;
+        }
+
         if (textEl.textContent.trim() === userText.trim()) {
             userEl.setAttribute('data-swipe-linked', '1');
             return;
