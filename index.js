@@ -547,10 +547,8 @@
         const chat = SillyTavern.getContext().chat;
         const originalUserText = chat && chat[userIndex] ? chat[userIndex].mes : null;
         if (originalUserText != null && userText.trim() === originalUserText.trim()) {
-            // Text wasn't modified – restore DOM if needed but don't highlight
-            if (textEl.textContent.trim() !== originalUserText.trim()) {
-                textEl.textContent = originalUserText;
-            }
+            // Text wasn't modified – restore formatted DOM and don't highlight
+            restoreUserBubbleFromChat(userEl);
             userEl.removeAttribute('data-swipe-linked');
             return;
         }
