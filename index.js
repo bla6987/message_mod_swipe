@@ -15,6 +15,9 @@
     let currentAssistantMesId = null; // Track current assistant for map cleanup
     let hasMessageSwipedEvent = false; // True if MESSAGE_SWIPED event is available
     let generationKey = null; // Key captured at generation start for interceptor use
+    let generationType = null; // Active generation type (normal/swipe/regenerate/continue/etc.)
+    let didReceiveMessageForGeneration = false; // True once MESSAGE_RECEIVED arrives for current generation
+    let pendingSwipeGenerationKey = null; // Previous swipe key captured before overswipe generation
     const MAX_MAP_ENTRIES = 100; // Safety limit for map size
 
     /**
@@ -61,6 +64,48 @@
             if (typeof entry.content === 'string') return entry.content;
         }
         return null;
+    }
+
+    function formatUserMessageText(rawText, chatIndex) {
+        const ctx = SillyTavern.getContext();
+        if (typeof ctx.messageFormatting === 'function') {
+            const msg = ctx.chat?.[chatIndex];
+            const userName = msg?.name || ctx.name1 || 'User';
+            const mesId = getMesIdFromChatIndex(chatIndex);
+            try {
+                return ctx.messageFormatting(rawText, userName, msg?.is_system || false, true, mesId, {}, false);
+            } catch (e) {
+                console.warn(`[${EXTENSION_NAME}] messageFormatting error:`, e);
+            }
+        }
+        // Fallback: escape HTML
+        const div = document.createElement('div');
+        div.textContent = rawText;
+        return div.innerHTML;
+    }
+
+    function restoreUserBubbleFromChat(mesEl) {
+        if (!mesEl) return;
+        const ctx = SillyTavern.getContext();
+        const chat = ctx.chat;
+        if (!chat) return;
+
+        const mesIdRaw = mesEl.getAttribute('mesid') || mesEl.getAttribute('data-mesid') || mesEl.getAttribute('data-message-id');
+        if (mesIdRaw == null) return;
+        const mesId = Number(mesIdRaw);
+        if (!Number.isFinite(mesId)) return;
+
+        const chatIndex = findChatIndexByMesId(mesId);
+        if (chatIndex == null) return;
+        const msg = chat[chatIndex];
+        if (!msg || !msg.is_user) return;
+
+        const textEl = getMesTextEl(mesEl);
+        if (!textEl) return;
+        const rawText = msg.extra?.display_text ?? msg.mes;
+        if (typeof rawText !== 'string') return;
+
+        textEl.innerHTML = formatUserMessageText(rawText, chatIndex);
     }
 
     function getOriginalUserTextFromMsg(userMsg) {
@@ -241,17 +286,20 @@
 
     /**
      * Get the swipe ID from a message object.
-     * Prefer swipes array length as it's updated before swipe_id in some cases
-     * (during swipe creation, the array gets the new entry before swipe_id increments).
+     * Prefer swipe_id because it tracks the currently selected swipe.
+     * Fall back to swipes length only when swipe_id is unavailable.
      */
     function getSwipeIdFromMsg(msg) {
-        // Prefer swipes array length as it's updated before swipe_id in some cases
+        // Prefer the active swipe pointer first.
+        if (typeof msg?.swipe_id === 'number') {
+            if (Array.isArray(msg?.swipes) && msg.swipes.length > 0) {
+                return Math.max(0, Math.min(msg.swipes.length - 1, msg.swipe_id));
+            }
+            return Math.max(0, msg.swipe_id);
+        }
+        // Fall back to the last known swipe when swipe_id is unavailable.
         if (Array.isArray(msg?.swipes) && msg.swipes.length > 0) {
             return msg.swipes.length - 1;
-        }
-        // Fall back to swipe_id property
-        if (typeof msg?.swipe_id === 'number') {
-            return msg.swipe_id;
         }
         return 0;
     }
@@ -310,6 +358,10 @@
             const mid = msg.mesid ?? msg.mesId ?? msg.message_id;
             if (mid === mesId) return true;
             if (typeof mid === 'string' && String(mesId) === mid) return true;
+        }
+        if (typeof mesId === 'number' && mesId >= 0 && mesId < chat.length) {
+            const candidate = chat[mesId];
+            return Boolean(candidate && !candidate.is_user && !candidate.is_system);
         }
         return false;
     }
@@ -402,6 +454,7 @@
     function clearAnySwipeLinkedHighlight() {
         const highlighted = document.querySelectorAll('#chat .mes[data-swipe-linked="1"]');
         highlighted.forEach((el) => {
+            restoreUserBubbleFromChat(el);
             el.removeAttribute('data-swipe-linked');
         });
     }
@@ -430,6 +483,9 @@
             return;
         }
 
+        if (userEl.hasAttribute('data-swipe-linked')) {
+            restoreUserBubbleFromChat(userEl);
+        }
         userEl.removeAttribute('data-swipe-linked');
     }
 
@@ -505,7 +561,7 @@
         }
 
         log('Updating user bubble to:', userText.substring(0, 60));
-        textEl.textContent = userText;
+        textEl.innerHTML = formatUserMessageText(userText, userIndex);
         userEl.setAttribute('data-swipe-linked', '1');
     }
 
@@ -589,6 +645,10 @@
         clearAnySwipeLinkedHighlight();
         activeKey = null;
         pendingUserText = null;
+        generationKey = null;
+        generationType = null;
+        didReceiveMessageForGeneration = false;
+        pendingSwipeGenerationKey = null;
         map.clear();
         currentAssistantMesId = null;
         detachObserver();
@@ -635,6 +695,10 @@
         return null;
     }
 
+    function shouldTrackGenerationType(type) {
+        return type !== 'quiet' && type !== 'impersonate';
+    }
+
     function onChatChanged() {
         // Restore any pending interceptor patch before clearing state
         restoreInterceptorPatch();
@@ -652,15 +716,25 @@
         });
     }
 
-    function onGenerationAfterCommands(data) {
-        if (data && typeof data === 'object' && data.dryRun === true) return;
+    function onGenerationAfterCommands(type, _generateOptions, dryRun) {
+        if (dryRun === true) return;
+        if (!shouldTrackGenerationType(type)) return;
+
         isGenerating = true;
+        generationType = typeof type === 'string' ? type : null;
+        didReceiveMessageForGeneration = false;
+
         // Snapshot the current last user message text (may be freshly edited)
-        pendingUserText = getLastUserMesFromDom() || getLastUserMesFromChat();
+        pendingUserText = getLastUserMesFromChat() || getLastUserMesFromDom();
 
         // Capture the key NOW before any state changes during generation
         refreshActiveKeyFromChat();
         generationKey = activeKey;
+        if (generationType === 'swipe' && (!generationKey || !map.has(generationKey)) && pendingSwipeGenerationKey && map.has(pendingSwipeGenerationKey)) {
+            generationKey = pendingSwipeGenerationKey;
+            log('GENERATION_AFTER_COMMANDS – using pre-overswipe key:', generationKey);
+        }
+        pendingSwipeGenerationKey = null;
 
         log('GENERATION_AFTER_COMMANDS – pending:', pendingUserText && pendingUserText.substring(0, 60), 'key:', generationKey);
 
@@ -673,11 +747,15 @@
         }, 60000); // 60 second safety
     }
 
-    function onGenerationStarted(data) {
-        if (data && typeof data === 'object' && data.dryRun === true) return;
+    function onGenerationStarted(type, _generateOptions, dryRun) {
+        if (dryRun === true) return;
+        if (!shouldTrackGenerationType(type)) return;
+
         isGenerating = true;
+        generationType = typeof type === 'string' ? type : generationType;
+        didReceiveMessageForGeneration = false;
         if (!pendingUserText) {
-            pendingUserText = getLastUserMesFromDom() || getLastUserMesFromChat();
+            pendingUserText = getLastUserMesFromChat() || getLastUserMesFromDom();
         }
     }
 
@@ -704,6 +782,7 @@
         const key = `${assistantMesId}:${swipeId}`;
         map.set(key, pendingUserText);
         activeKey = key;
+        didReceiveMessageForGeneration = true;
         log('MESSAGE_RECEIVED – stored mapping', key, '->', pendingUserText.substring(0, 60));
     }
 
@@ -727,31 +806,44 @@
     function onGenerationEnded() {
         isGenerating = false;
         generationKey = null; // Clear the generation-specific key
+        pendingSwipeGenerationKey = null;
         restoreInterceptorPatch();
 
-        if (pendingUserText) {
-            const ctx = SillyTavern.getContext();
-            const chat = ctx.chat;
-            const aiIdx = getLastAssistantIndexFromChat();
-            const aiMsg = aiIdx != null && chat ? chat[aiIdx] : null;
-            if (aiMsg) {
-                const assistantMesId = getMesIdFromChatIndex(aiIdx);
-                // Clean up old entries before storing new mapping
-                cleanupMapEntries(assistantMesId);
-
-                const swipeId = getSwipeIdFromMsg(aiMsg);
-                const key = `${assistantMesId}:${swipeId}`;
-                map.set(key, pendingUserText);
-                activeKey = key;
-                log('GENERATION_ENDED – stored mapping', key, '->', pendingUserText.substring(0, 60));
-            }
-            pendingUserText = null;
+        if (!didReceiveMessageForGeneration && pendingUserText) {
+            log('GENERATION_ENDED – no MESSAGE_RECEIVED for tracked generation; skipped fallback mapping write');
         }
+        pendingUserText = null;
+        generationType = null;
+        didReceiveMessageForGeneration = false;
     }
 
     function onMessageSwiped(messageIndex) {
         messageIndex = normalizeMessageIndex(messageIndex);
+        const previousKey = activeKey;
         log('MESSAGE_SWIPED', messageIndex);
+
+        // Synchronously detect overswipe BEFORE rAF, because Generate('swipe')
+        // fires immediately after this emit resolves.
+        const ctx = SillyTavern.getContext();
+        const chat = ctx.chat;
+        let aiIdx = messageIndex != null ? findChatIndexByMesId(messageIndex) : getLastAssistantIndexFromChat();
+        if (aiIdx == null && typeof messageIndex === 'number' && messageIndex >= 0 && chat && messageIndex < chat.length) {
+            aiIdx = messageIndex;
+        }
+        const aiMsg = aiIdx != null && chat ? chat[aiIdx] : null;
+        const isOverswipePending = Boolean(
+            aiMsg &&
+            Array.isArray(aiMsg.swipes) &&
+            typeof aiMsg.swipe_id === 'number' &&
+            aiMsg.swipe_id >= aiMsg.swipes.length,
+        );
+        if (isOverswipePending && previousKey && map.has(previousKey)) {
+            pendingSwipeGenerationKey = previousKey;
+            log('MESSAGE_SWIPED – captured pre-overswipe key', pendingSwipeGenerationKey);
+        } else if (!isGenerating) {
+            pendingSwipeGenerationKey = null;
+        }
+
         requestAnimationFrame(() => {
             if (messageIndex != null) {
                 refreshActiveKeyFromChat(messageIndex);
@@ -782,9 +874,9 @@
 
     function onMessageEdited(messageIndex) {
         messageIndex = normalizeMessageIndex(messageIndex);
-        // Keep pending text in sync with what user actually sees.
-        // This helps in staging where ctx.chat can lag behind the UI.
-        pendingUserText = getLastUserMesFromDom() || getLastUserMesFromChat();
+        // Keep pending text in sync with the latest edit.
+        // Prefer chat object for raw markdown; fall back to DOM textContent.
+        pendingUserText = getLastUserMesFromChat() || getLastUserMesFromDom();
         log('MESSAGE_EDITED – pending updated:', pendingUserText && pendingUserText.substring(0, 60));
     }
 
@@ -886,11 +978,14 @@
         // Preserve mappings so follow-up assistant generations can patch historical context.
         // Just clear any pending text from an in-flight capture.
         pendingUserText = null;
+        pendingSwipeGenerationKey = null;
     }
 
     // ─── Generate Interceptor ────────────────────────────────────────────────────
 
     globalThis.swipeLinkedUserEditInterceptor = async function (chat, _contextSize, _abort, _type) {
+        if (!shouldTrackGenerationType(_type)) return;
+
         // Restore any previous patch first
         if (interceptorRestore) restoreInterceptorPatch();
 
@@ -916,6 +1011,7 @@
             return null;
         };
 
+        // Primary path: locate the mapped assistant in the interceptor chat and take the user immediately before it.
         let assistantIdx = -1;
         for (let i = chat.length - 1; i >= 0; i--) {
             const mid = getMesIdFromMsg(chat[i]);
@@ -924,13 +1020,23 @@
                 break;
             }
         }
-        if (assistantIdx === -1) return;
-
         let userIdx = -1;
-        for (let i = assistantIdx - 1; i >= 0; i--) {
-            if (chat[i]?.is_user) {
-                userIdx = i;
-                break;
+        if (assistantIdx !== -1) {
+            for (let i = assistantIdx - 1; i >= 0; i--) {
+                if (chat[i]?.is_user) {
+                    userIdx = i;
+                    break;
+                }
+            }
+        }
+
+        // Fallback: patch the last user message in the prompt.
+        if (userIdx === -1) {
+            for (let i = chat.length - 1; i >= 0; i--) {
+                if (chat[i]?.is_user) {
+                    userIdx = i;
+                    break;
+                }
             }
         }
         if (userIdx === -1) return;

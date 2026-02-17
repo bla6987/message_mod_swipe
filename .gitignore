@@ -1,0 +1,22 @@
+.ai-notes/
+
+# >>> agent_rules.sh managed >>>
+# Managed from AGENTS.md — do not edit these directly
+AGENTS.md
+.aider.conf.yml
+CLAUDE.md
+CONVENTIONS.md
+GEMINI.md
+.cursorrules
+.windsurfrules
+.continuerules
+.rules
+.cursor/rules/project.mdc
+.windsurf/rules/
+.github/copilot-instructions.md
+.clinerules/
+.gemini/styleguide.md
+.aiassistant/
+.amazonq/
+.plandex/
+# <<< agent_rules.sh managed <<<
