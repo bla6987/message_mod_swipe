@@ -19,6 +19,8 @@
     let didReceiveMessageForGeneration = false; // True once MESSAGE_RECEIVED arrives for current generation
     let pendingSwipeGenerationKey = null; // Previous swipe key captured before overswipe generation
     const MAX_MAP_ENTRIES = 100; // Safety limit for map size
+    const mesElCache = new Map(); // mesId -> Element cache for getMesElByIndex
+    let lastMesElCache = { user: null, assistant: null }; // cached results for getLastMesEl
 
     /**
      * Cleanup map entries and enforce size limit.
@@ -31,9 +33,14 @@
 
         // Enforce max size limit (FIFO eviction)
         if (map.size > MAX_MAP_ENTRIES) {
-            const keysToDelete = [...map.keys()].slice(0, map.size - MAX_MAP_ENTRIES);
-            keysToDelete.forEach(k => map.delete(k));
-            log('Evicted', keysToDelete.length, 'old map entries');
+            let evicted = 0;
+            const toEvict = map.size - MAX_MAP_ENTRIES;
+            for (const k of map.keys()) {
+                if (evicted >= toEvict) break;
+                map.delete(k);
+                evicted++;
+            }
+            log('Evicted', evicted, 'old map entries');
         }
     }
 
@@ -184,14 +191,28 @@
 
     // ─── DOM Selectors (resilient) ───────────────────────────────────────────────
 
+    function invalidateMesElCache() {
+        mesElCache.clear();
+        lastMesElCache.user = null;
+        lastMesElCache.assistant = null;
+    }
+
     function getLastMesEl(isUser) {
+        const cacheKey = isUser ? 'user' : 'assistant';
+        if (lastMesElCache[cacheKey] && lastMesElCache[cacheKey].isConnected) {
+            return lastMesElCache[cacheKey];
+        }
+
         const els = document.querySelectorAll('#chat .mes[is_user]');
         if (els.length) {
             const truthy = new Set(['true', '1']);
             const falsy = new Set(['false', '0']);
             for (let i = els.length - 1; i >= 0; i--) {
                 const v = (els[i].getAttribute('is_user') || '').toLowerCase();
-                if (isUser ? truthy.has(v) : falsy.has(v)) return els[i];
+                if (isUser ? truthy.has(v) : falsy.has(v)) {
+                    lastMesElCache[cacheKey] = els[i];
+                    return els[i];
+                }
             }
         }
 
@@ -199,7 +220,9 @@
         try {
             const idx = isUser ? getLastUserIndexFromChat() : getLastAssistantIndexFromChat();
             if (idx == null) return null;
-            return getMesElByIndex(getMesIdFromChatIndex(idx));
+            const el = getMesElByIndex(getMesIdFromChatIndex(idx));
+            lastMesElCache[cacheKey] = el;
+            return el;
         } catch {
             return null;
         }
@@ -207,6 +230,11 @@
 
     function getMesElByIndex(index) {
         if (index == null || index < 0) return null;
+
+        // Return cached element if still in the DOM
+        const cached = mesElCache.get(index);
+        if (cached && cached.isConnected) return cached;
+
         const selectors = [
             `#chat .mes[mesid="${index}"]`,
             `#chat .mes[data-mesid="${index}"]`,
@@ -215,7 +243,10 @@
         ];
         for (const sel of selectors) {
             const el = document.querySelector(sel);
-            if (el) return el;
+            if (el) {
+                mesElCache.set(index, el);
+                return el;
+            }
         }
 
         const normalizeId = (v) => {
@@ -245,7 +276,10 @@
             ];
             for (const c of candidates) {
                 const n = normalizeId(c);
-                if (n === index) return el;
+                if (n === index) {
+                    mesElCache.set(index, el);
+                    return el;
+                }
             }
         }
         return null;
@@ -604,7 +638,7 @@
 
     function scheduleSwipeCheck() {
         if (swipeDebounceTimer) clearTimeout(swipeDebounceTimer);
-        swipeDebounceTimer = setTimeout(handleSwipeChange, 80);
+        swipeDebounceTimer = setTimeout(handleSwipeChange, 200);
     }
 
     // ─── MutationObserver ────────────────────────────────────────────────────────
@@ -625,9 +659,13 @@
             log('attachObserver: no assistant text element found');
             return;
         }
-        observer = new MutationObserver(() => {
+        observer = new MutationObserver((mutations) => {
             // Only use MutationObserver for swipe detection if MESSAGE_SWIPED event is unavailable
-            if (!isGenerating && !hasMessageSwipedEvent) scheduleSwipeCheck();
+            if (hasMessageSwipedEvent) return;
+            // Skip characterData-only mutations during streaming (text content updates, not swipes)
+            const allCharacterData = mutations.every(m => m.type === 'characterData');
+            if (allCharacterData) return;
+            if (!isGenerating) scheduleSwipeCheck();
         });
         observer.observe(textEl, {
             characterData: true,
@@ -650,6 +688,7 @@
         map.clear();
         currentAssistantMesId = null;
         detachObserver();
+        invalidateMesElCache();
         if (swipeDebounceTimer) {
             clearTimeout(swipeDebounceTimer);
             swipeDebounceTimer = null;
@@ -707,6 +746,7 @@
             lastChatId = currentId;
             clearState();
         }
+        invalidateMesElCache();
         // Capture initial state for the new chat's last pair
         requestAnimationFrame(() => {
             captureCurrentState();
@@ -786,6 +826,7 @@
 
     function onCharacterMessageRendered(messageIndex) {
         messageIndex = normalizeMessageIndex(messageIndex);
+        invalidateMesElCache();
         // Reattach observer to the newest assistant message
         requestAnimationFrame(() => {
             attachObserver();
@@ -879,6 +920,7 @@
     }
 
     function onMessageDeleted(_chatLength) {
+        invalidateMesElCache();
         // MESSAGE_DELETED only provides chat.length, not which message was deleted.
         // Scan all map keys and remove any whose mesId no longer exists in chat.
 
@@ -1069,6 +1111,14 @@
     }
 
     // ─── Init / Teardown ─────────────────────────────────────────────────────────
+
+    function teardown() {
+        clearState();
+        document.removeEventListener('click', onDocumentClick);
+        log('Extension torn down');
+    }
+
+    globalThis.swipeLinkedUserEditTeardown = teardown;
 
     function init() {
         const ctx = SillyTavern.getContext();
