@@ -1070,12 +1070,39 @@
             }
         }
 
-        // Fallback: patch the last user message in the prompt.
         if (userIdx === -1) {
+            log('Interceptor assistant lookup miss for key', keyToUse, 'assistantMesId', assistantMesId);
+
+            // Safe fallback: patch the user immediately before the most recent assistant.
+            // This avoids rewriting a freshly-sent user message during normal generation.
+            let latestAssistantIdx = -1;
             for (let i = chat.length - 1; i >= 0; i--) {
-                if (chat[i]?.is_user) {
-                    userIdx = i;
+                const candidate = chat[i];
+                if (candidate && !candidate.is_user && !candidate.is_system) {
+                    latestAssistantIdx = i;
                     break;
+                }
+            }
+
+            if (latestAssistantIdx !== -1) {
+                for (let i = latestAssistantIdx - 1; i >= 0; i--) {
+                    if (chat[i]?.is_user) {
+                        userIdx = i;
+                        log('Interceptor fallback selected user idx', userIdx, 'before assistant idx', latestAssistantIdx);
+                        break;
+                    }
+                }
+            }
+
+            // Regenerate/swipe prompt shape can omit assistant rows entirely.
+            // In that case, fall back to the last user only for regeneration-like types.
+            if (userIdx === -1 && latestAssistantIdx === -1 && (_type === 'swipe' || _type === 'regenerate' || _type === 'continue')) {
+                for (let i = chat.length - 1; i >= 0; i--) {
+                    if (chat[i]?.is_user) {
+                        userIdx = i;
+                        log('Interceptor fallback selected last user idx', userIdx, 'for type', _type);
+                        break;
+                    }
                 }
             }
         }
