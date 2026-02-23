@@ -60,8 +60,8 @@ Debug logs are prefixed with `[swipe_linked_user_edit]`.
 
 ## How It Works (internals)
 
-1. `GENERATION_AFTER_COMMANDS` — snapshots the current last user message text.
-2. `MESSAGE_RECEIVED` — stores `assistantMesId:swipeId → userText` in a Map.
+1. `GENERATION_AFTER_COMMANDS` — snapshots user text for regeneration-like flows (`swipe`/`regenerate`/`continue`). For `normal` sends, mapping is resolved from chat adjacency when the assistant arrives.
+2. `MESSAGE_RECEIVED` — stores `assistantMesId:swipeId → userText` in a Map (using the assistant's preceding user row for normal sends).
 3. Swipe detection (MutationObserver on assistant `.mes_text` + delegated click on `.swipe_left`/`.swipe_right`) triggers a lookup and DOM update.
-4. `generate_interceptor` — ephemerally patches the last user message in the outgoing prompt array (clones only that one message object; restores on `GENERATION_ENDED`).
+4. `generate_interceptor` — ephemerally patches `msg.mes` on the selected user message in the outgoing prompt array and restores it on `GENERATION_ENDED`.
 5. `CHAT_CHANGED` — clears all state. `MESSAGE_SENT` only clears the pending snapshot.

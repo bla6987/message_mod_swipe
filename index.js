@@ -762,8 +762,14 @@
         generationType = typeof type === 'string' ? type : null;
         didReceiveMessageForGeneration = false;
 
-        // Snapshot the current last user message text (may be freshly edited)
-        pendingUserText = getLastUserMesFromChat() || getLastUserMesFromDom();
+        // For normal sends, ST appends the new user message later in the flow.
+        // Capturing here would snapshot the previous user turn and can pollute mappings.
+        if (generationType === 'normal') {
+            pendingUserText = null;
+        } else {
+            // Snapshot the current last user message text (may be freshly edited)
+            pendingUserText = getLastUserMesFromChat() || getLastUserMesFromDom();
+        }
 
         // Capture the key NOW before any state changes during generation
         refreshActiveKeyFromChat();
@@ -792,7 +798,7 @@
         isGenerating = true;
         generationType = typeof type === 'string' ? type : generationType;
         didReceiveMessageForGeneration = false;
-        if (!pendingUserText) {
+        if (!pendingUserText && generationType !== 'normal') {
             pendingUserText = getLastUserMesFromChat() || getLastUserMesFromDom();
         }
     }
@@ -803,6 +809,9 @@
         const chat = ctx.chat;
         if (!chat || messageIndex == null) return;
 
+        // Ignore assistant inserts that are not part of the currently tracked generation.
+        if (!isGenerating || !shouldTrackGenerationType(generationType)) return;
+
         const chatIndex = findChatIndexByMesId(messageIndex);
         if (chatIndex == null) return;
 
@@ -810,7 +819,21 @@
         if (!msg || msg.is_user || msg.is_system) return;
 
         const aiMes = msg.mes;
-        if (!aiMes || !pendingUserText) return;
+        if (!aiMes) return;
+
+        let userTextForMapping = null;
+        if (generationType === 'normal') {
+            // For normal sends, use the user immediately before the received assistant.
+            // This avoids stale pending text captured before ST appends the new user row.
+            const userIdx = getUserIndexBefore(chatIndex);
+            if (userIdx != null && typeof chat[userIdx]?.mes === 'string') {
+                userTextForMapping = chat[userIdx].mes;
+            }
+        } else if (typeof pendingUserText === 'string') {
+            userTextForMapping = pendingUserText;
+        }
+
+        if (typeof userTextForMapping !== 'string') return;
 
         const assistantMesId = getMesIdFromChatIndex(chatIndex);
         // Clean up old entries before storing new mapping
@@ -818,10 +841,10 @@
 
         const swipeId = getSwipeIdFromMsg(msg);
         const key = `${assistantMesId}:${swipeId}`;
-        map.set(key, pendingUserText);
+        map.set(key, userTextForMapping);
         activeKey = key;
         didReceiveMessageForGeneration = true;
-        log('MESSAGE_RECEIVED – stored mapping', key, '->', pendingUserText.substring(0, 60));
+        log('MESSAGE_RECEIVED – stored mapping', key, '->', userTextForMapping.substring(0, 60));
     }
 
     function onCharacterMessageRendered(messageIndex) {
@@ -1073,14 +1096,28 @@
         if (userIdx === -1) {
             log('Interceptor assistant lookup miss for key', keyToUse, 'assistantMesId', assistantMesId);
 
+            // Regeneration-like prompt shapes may omit assistant rows.
+            // Prefer patching the last user in these prompt types.
+            if (_type === 'swipe' || _type === 'regenerate' || _type === 'continue') {
+                for (let i = chat.length - 1; i >= 0; i--) {
+                    if (chat[i]?.is_user) {
+                        userIdx = i;
+                        log('Interceptor fallback selected last user idx', userIdx, 'for type', _type);
+                        break;
+                    }
+                }
+            }
+
             // Safe fallback: patch the user immediately before the most recent assistant.
             // This avoids rewriting a freshly-sent user message during normal generation.
             let latestAssistantIdx = -1;
-            for (let i = chat.length - 1; i >= 0; i--) {
-                const candidate = chat[i];
-                if (candidate && !candidate.is_user && !candidate.is_system) {
-                    latestAssistantIdx = i;
-                    break;
+            if (userIdx === -1) {
+                for (let i = chat.length - 1; i >= 0; i--) {
+                    const candidate = chat[i];
+                    if (candidate && !candidate.is_user && !candidate.is_system) {
+                        latestAssistantIdx = i;
+                        break;
+                    }
                 }
             }
 
@@ -1094,8 +1131,7 @@
                 }
             }
 
-            // Regenerate/swipe prompt shape can omit assistant rows entirely.
-            // In that case, fall back to the last user only for regeneration-like types.
+            // As a final fallback, try the last user for regeneration-like types.
             if (userIdx === -1 && latestAssistantIdx === -1 && (_type === 'swipe' || _type === 'regenerate' || _type === 'continue')) {
                 for (let i = chat.length - 1; i >= 0; i--) {
                     if (chat[i]?.is_user) {
