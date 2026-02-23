@@ -1024,7 +1024,7 @@
     // ─── Generate Interceptor ────────────────────────────────────────────────────
 
     globalThis.swipeLinkedUserEditInterceptor = async function (chat, _contextSize, _abort, _type) {
-        if (!shouldTrackGenerationType(_type)) return;
+        if (_type !== 'swipe' && _type !== 'regenerate' && _type !== 'continue') return;
 
         // Restore any previous patch first
         if (interceptorRestore) restoreInterceptorPatch();
