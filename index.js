@@ -12,7 +12,6 @@
     let swipeDebounceTimer = null;
     let interceptorRestore = null;
     let lastChatId = null;
-    let currentAssistantMesId = null; // Track current assistant for map cleanup
     let hasMessageSwipedEvent = false; // True if MESSAGE_SWIPED event is available
     let generationKey = null; // Key captured at generation start for interceptor use
     let generationType = null; // Active generation type (normal/swipe/regenerate/continue/etc.)
@@ -21,28 +20,7 @@
     const MAX_MAP_ENTRIES = 100; // Safety limit for map size
     const mesElCache = new Map(); // mesId -> Element cache for getMesElByIndex
     let lastMesElCache = { user: null, assistant: null }; // cached results for getLastMesEl
-
-    /**
-     * Cleanup map entries and enforce size limit.
-     * Called when storing a new mapping after generation.
-     * Only enforces max size limit (FIFO eviction) - don't delete entries based on
-     * assistant change since user may swipe back to earlier messages.
-     */
-    function cleanupMapEntries(newAssistantMesId) {
-        currentAssistantMesId = newAssistantMesId;
-
-        // Enforce max size limit (FIFO eviction)
-        if (map.size > MAX_MAP_ENTRIES) {
-            let evicted = 0;
-            const toEvict = map.size - MAX_MAP_ENTRIES;
-            for (const k of map.keys()) {
-                if (evicted >= toEvict) break;
-                map.delete(k);
-                evicted++;
-            }
-            log('Evicted', evicted, 'old map entries');
-        }
-    }
+    const eventSubscriptions = [];
 
     // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -60,6 +38,38 @@
         if (getSettings().debug) {
             console.log(`[${EXTENSION_NAME}]`, ...args);
         }
+    }
+
+    function setMapping(assistantMesId, swipeId, userText, { setActive = false, source = '' } = {}) {
+        if (!Number.isFinite(assistantMesId) || !Number.isFinite(swipeId)) return null;
+        if (typeof userText !== 'string') return null;
+
+        const key = `${assistantMesId}:${swipeId}`;
+        map.set(key, userText);
+
+        let evicted = 0;
+        while (map.size > MAX_MAP_ENTRIES) {
+            const oldestKey = map.keys().next().value;
+            if (typeof oldestKey !== 'string') break;
+            map.delete(oldestKey);
+            if (activeKey === oldestKey && !setActive) {
+                activeKey = null;
+            }
+            evicted++;
+        }
+
+        if (setActive) {
+            activeKey = map.has(key) ? key : null;
+        }
+
+        if (source) {
+            log(source, 'stored mapping', key, '->', userText.substring(0, 60));
+        }
+        if (evicted > 0) {
+            log('setMapping evicted', evicted, 'old map entries');
+        }
+
+        return key;
     }
 
     function extractSwipeText(entry) {
@@ -145,8 +155,7 @@
         if (typeof originalUserText === 'string') {
             const key0 = `${assistantMesId}:0`;
             if (!map.has(key0)) {
-                map.set(key0, originalUserText);
-                log('ensureMappingForAssistantMesId – stored mapping', key0, '->', originalUserText.substring(0, 60));
+                setMapping(assistantMesId, 0, originalUserText, { source: 'ensureMappingForAssistantMesId' });
             }
         }
 
@@ -156,8 +165,7 @@
         if (typeof currentUserText === 'string' && shouldBackfillSwipeMapping(userMsg, swipeId)) {
             const key = `${assistantMesId}:${swipeId}`;
             if (!map.has(key)) {
-                map.set(key, currentUserText);
-                log('ensureMappingForAssistantMesId – stored mapping', key, '->', currentUserText.substring(0, 60));
+                setMapping(assistantMesId, swipeId, currentUserText, { source: 'ensureMappingForAssistantMesId' });
             }
         }
     }
@@ -383,23 +391,6 @@
         return null;
     }
 
-    function mesIdExistsInChat(mesId) {
-        const chat = SillyTavern.getContext().chat;
-        if (!chat || mesId == null) return false;
-        for (let i = 0; i < chat.length; i++) {
-            const msg = chat[i];
-            if (!msg) continue;
-            const mid = msg.mesid ?? msg.mesId ?? msg.message_id;
-            if (mid === mesId) return true;
-            if (typeof mid === 'string' && String(mesId) === mid) return true;
-        }
-        if (typeof mesId === 'number' && mesId >= 0 && mesId < chat.length) {
-            const candidate = chat[mesId];
-            return Boolean(candidate && !candidate.is_user && !candidate.is_system);
-        }
-        return false;
-    }
-
     function getLastUserIndexFromChat() {
         const chat = SillyTavern.getContext().chat;
         if (!chat) return null;
@@ -437,16 +428,6 @@
         return null;
     }
 
-    function getLastAssistantMesFromChat() {
-        const chat = SillyTavern.getContext().chat;
-        if (!chat) return null;
-        for (let i = chat.length - 1; i >= 0; i--) {
-            const m = chat[i];
-            if (m && !m.is_user && !m.is_system) return m.mes;
-        }
-        return null;
-    }
-
     // ─── Capture / Store ─────────────────────────────────────────────────────────
 
     /**
@@ -454,23 +435,21 @@
      * variant is also tracked even if no generation happened while the ext was loaded.
      */
     function captureCurrentState() {
-        const userMes = getLastUserMesFromChat();
         const aiIdx = getLastAssistantIndexFromChat();
         const chat = SillyTavern.getContext().chat;
         const aiMsg = aiIdx != null && chat ? chat[aiIdx] : null;
-        if (!userMes || !aiMsg) return;
-
         const userIdx = getUserIndexBefore(aiIdx);
         const userMsg = userIdx != null && chat ? chat[userIdx] : null;
+        const userMes = typeof userMsg?.mes === 'string' ? userMsg.mes : null;
+        if (typeof userMes !== 'string' || !aiMsg) return;
 
         const assistantMesId = getMesIdFromChatIndex(aiIdx);
         const swipeId = resolveSwipeId(assistantMesId, aiMsg);
+        const key = `${assistantMesId}:${swipeId}`;
+        activeKey = key;
         if (shouldBackfillSwipeMapping(userMsg, swipeId)) {
-            const key = `${assistantMesId}:${swipeId}`;
             if (!map.has(key)) {
-                map.set(key, userMes);
-                activeKey = key;
-                log('captureCurrentState', key, userMes.substring(0, 60));
+                setMapping(assistantMesId, swipeId, userMes, { setActive: true, source: 'captureCurrentState' });
             }
         }
 
@@ -479,8 +458,7 @@
         if (typeof originalUserText === 'string') {
             const key0 = `${assistantMesId}:0`;
             if (!map.has(key0)) {
-                map.set(key0, originalUserText);
-                log('captureCurrentState', key0, originalUserText.substring(0, 60));
+                setMapping(assistantMesId, 0, originalUserText, { source: 'captureCurrentState' });
             }
         }
     }
@@ -686,7 +664,6 @@
         didReceiveMessageForGeneration = false;
         pendingSwipeGenerationKey = null;
         map.clear();
-        currentAssistantMesId = null;
         detachObserver();
         invalidateMesElCache();
         if (swipeDebounceTimer) {
@@ -836,15 +813,13 @@
         if (typeof userTextForMapping !== 'string') return;
 
         const assistantMesId = getMesIdFromChatIndex(chatIndex);
-        // Clean up old entries before storing new mapping
-        cleanupMapEntries(assistantMesId);
-
         const swipeId = getSwipeIdFromMsg(msg);
-        const key = `${assistantMesId}:${swipeId}`;
-        map.set(key, userTextForMapping);
-        activeKey = key;
+        const storedKey = setMapping(assistantMesId, swipeId, userTextForMapping, {
+            setActive: true,
+            source: 'MESSAGE_RECEIVED',
+        });
+        if (!storedKey) return;
         didReceiveMessageForGeneration = true;
-        log('MESSAGE_RECEIVED – stored mapping', key, '->', userTextForMapping.substring(0, 60));
     }
 
     function onCharacterMessageRendered(messageIndex) {
@@ -944,56 +919,21 @@
 
     function onMessageDeleted(_chatLength) {
         invalidateMesElCache();
-        // MESSAGE_DELETED only provides chat.length, not which message was deleted.
-        // Scan all map keys and remove any whose mesId no longer exists in chat.
+        clearAnySwipeLinkedHighlight();
+        map.clear();
+        activeKey = null;
+        generationKey = null;
+        pendingSwipeGenerationKey = null;
+        log('MESSAGE_DELETED – cleared mappings and rebuilding current state');
 
-        if (map.size === 0) return;
-
-        // Extract unique mesIds from map keys (format: "mesId:swipeId")
-        const trackedMesIds = new Set();
-        for (const key of map.keys()) {
-            const colonIdx = key.indexOf(':');
-            if (colonIdx > 0) {
-                const mesId = Number(key.substring(0, colonIdx));
-                if (Number.isFinite(mesId)) {
-                    trackedMesIds.add(mesId);
-                }
+        requestAnimationFrame(() => {
+            captureCurrentState();
+            const aiIdx = getLastAssistantIndexFromChat();
+            if (aiIdx != null) {
+                ensureMappingForAssistantMesId(getMesIdFromChatIndex(aiIdx));
             }
-        }
-
-        // Find which mesIds no longer exist
-        const orphanedMesIds = [];
-        for (const mesId of trackedMesIds) {
-            if (!mesIdExistsInChat(mesId)) {
-                orphanedMesIds.push(mesId);
-            }
-        }
-
-        if (orphanedMesIds.length === 0) return;
-
-        // Remove all mappings for orphaned mesIds
-        let removed = 0;
-        let activeKeyCleared = false;
-        for (const mesId of orphanedMesIds) {
-            const prefix = `${mesId}:`;
-            for (const key of [...map.keys()]) {
-                if (key.startsWith(prefix)) {
-                    map.delete(key);
-                    removed++;
-                }
-            }
-            // Clear activeKey if it referenced a deleted message
-            if (activeKey && activeKey.startsWith(prefix)) {
-                activeKey = null;
-                activeKeyCleared = true;
-            }
-        }
-
-        if (activeKeyCleared) {
-            clearAnySwipeLinkedHighlight();
-        }
-
-        log('MESSAGE_DELETED – removed', removed, 'mappings for', orphanedMesIds.length, 'deleted messages');
+            handleSwipeChange();
+        });
     }
 
     function onMessageSwipeDeleted(data) {
@@ -1022,7 +962,9 @@
         for (const { oldKey, oldIdx } of toRename) {
             const value = map.get(oldKey);
             map.delete(oldKey);
-            map.set(`${assistantMesId}:${oldIdx - 1}`, value);
+            if (typeof value === 'string') {
+                setMapping(assistantMesId, oldIdx - 1, value, { source: 'MESSAGE_SWIPE_DELETED' });
+            }
         }
 
         log('MESSAGE_SWIPE_DELETED – shifted', toRename.length, 'mappings, deleted key', deletedKey);
@@ -1175,8 +1117,30 @@
 
     // ─── Init / Teardown ─────────────────────────────────────────────────────────
 
+    function bindEvent(eventSource, eventName, handler) {
+        if (!eventSource || !eventName || typeof handler !== 'function') return;
+        eventSource.on(eventName, handler);
+        eventSubscriptions.push({ eventSource, eventName, handler });
+    }
+
+    function unbindAllEvents() {
+        for (const { eventSource, eventName, handler } of eventSubscriptions.splice(0, eventSubscriptions.length)) {
+            try {
+                if (typeof eventSource?.removeListener === 'function') {
+                    eventSource.removeListener(eventName, handler);
+                } else if (typeof eventSource?.off === 'function') {
+                    eventSource.off(eventName, handler);
+                }
+            } catch (e) {
+                console.warn(`[${EXTENSION_NAME}] Failed to remove listener`, eventName, e);
+            }
+        }
+    }
+
     function teardown() {
+        unbindAllEvents();
         clearState();
+        hasMessageSwipedEvent = false;
         document.removeEventListener('click', onDocumentClick);
         log('Extension torn down');
     }
@@ -1192,32 +1156,36 @@
             return;
         }
 
+        unbindAllEvents();
+        document.removeEventListener('click', onDocumentClick);
+
         // Register event handlers
-        eventSource.on(event_types.CHAT_CHANGED, onChatChanged);
-        eventSource.on(event_types.GENERATION_AFTER_COMMANDS, onGenerationAfterCommands);
+        bindEvent(eventSource, event_types.CHAT_CHANGED, onChatChanged);
+        bindEvent(eventSource, event_types.GENERATION_AFTER_COMMANDS, onGenerationAfterCommands);
         if (event_types.GENERATION_STARTED) {
-            eventSource.on(event_types.GENERATION_STARTED, onGenerationStarted);
+            bindEvent(eventSource, event_types.GENERATION_STARTED, onGenerationStarted);
         }
-        eventSource.on(event_types.MESSAGE_RECEIVED, onMessageReceived);
+        bindEvent(eventSource, event_types.MESSAGE_RECEIVED, onMessageReceived);
         if (event_types.MESSAGE_UPDATED) {
-            eventSource.on(event_types.MESSAGE_UPDATED, onMessageUpdated);
+            bindEvent(eventSource, event_types.MESSAGE_UPDATED, onMessageUpdated);
         }
         if (event_types.MESSAGE_EDITED) {
-            eventSource.on(event_types.MESSAGE_EDITED, onMessageEdited);
+            bindEvent(eventSource, event_types.MESSAGE_EDITED, onMessageEdited);
         }
-        eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, onCharacterMessageRendered);
-        eventSource.on(event_types.GENERATION_ENDED, onGenerationEnded);
-        eventSource.on(event_types.GENERATION_STOPPED, onGenerationEnded);
-        eventSource.on(event_types.MESSAGE_SENT, onMessageSent);
+        bindEvent(eventSource, event_types.CHARACTER_MESSAGE_RENDERED, onCharacterMessageRendered);
+        bindEvent(eventSource, event_types.GENERATION_ENDED, onGenerationEnded);
+        bindEvent(eventSource, event_types.GENERATION_STOPPED, onGenerationEnded);
+        bindEvent(eventSource, event_types.MESSAGE_SENT, onMessageSent);
+        hasMessageSwipedEvent = false;
         if (event_types.MESSAGE_SWIPED) {
             hasMessageSwipedEvent = true;
-            eventSource.on(event_types.MESSAGE_SWIPED, onMessageSwiped);
+            bindEvent(eventSource, event_types.MESSAGE_SWIPED, onMessageSwiped);
         }
         if (event_types.MESSAGE_DELETED) {
-            eventSource.on(event_types.MESSAGE_DELETED, onMessageDeleted);
+            bindEvent(eventSource, event_types.MESSAGE_DELETED, onMessageDeleted);
         }
         if (event_types.MESSAGE_SWIPE_DELETED) {
-            eventSource.on(event_types.MESSAGE_SWIPE_DELETED, onMessageSwipeDeleted);
+            bindEvent(eventSource, event_types.MESSAGE_SWIPE_DELETED, onMessageSwipeDeleted);
         }
 
         // Delegated click handler for swipe buttons
