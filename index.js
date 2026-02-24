@@ -994,101 +994,62 @@
         // Restore any previous patch first
         if (interceptorRestore) restoreInterceptorPatch();
 
+        const abortInterceptor = (reason, details = {}) => {
+            log('Interceptor abort', reason, details);
+            console.warn(`[${EXTENSION_NAME}] Interceptor aborted (${reason})`, details);
+            if (typeof _abort === 'function') {
+                _abort(true);
+            }
+        };
+
         // Use the key captured at generation start, not current state
         // This avoids race conditions where swipe_id may have changed
         const keyToUse = generationKey || activeKey;
-        if (!keyToUse || !map.has(keyToUse)) return;
-
-        const mappedText = map.get(keyToUse);
-        if (!mappedText) return;
-
-        const mappedTextStr = typeof mappedText === 'string' ? mappedText : String(mappedText);
+        if (!keyToUse) {
+            abortInterceptor('missing_key', { type: _type });
+            return;
+        }
 
         const m = /^([0-9]+):([0-9]+)$/.exec(keyToUse);
-        if (!m) return;
-        const assistantMesId = Number(m[1]);
+        if (!m) {
+            abortInterceptor('invalid_key', { type: _type, keyToUse });
+            return;
+        }
 
-        const getMesIdFromMsg = (msg) => {
-            if (!msg) return null;
-            const mid = msg.mesid ?? msg.mesId ?? msg.message_id;
-            if (typeof mid === 'number') return mid;
-            if (typeof mid === 'string' && mid.trim() !== '' && !Number.isNaN(Number(mid))) return Number(mid);
-            return null;
-        };
+        if (!map.has(keyToUse)) {
+            abortInterceptor('missing_map', { type: _type, keyToUse });
+            return;
+        }
 
-        // Primary path: locate the mapped assistant in the interceptor chat and take the user immediately before it.
-        let assistantIdx = -1;
+        const mappedText = map.get(keyToUse);
+        if (typeof mappedText !== 'string') {
+            abortInterceptor('target_mismatch', { type: _type, keyToUse });
+            return;
+        }
+
+        // For swipe-like prompt shapes, always patch the latest user row in interceptor chat.
+        let userIdx = -1;
         for (let i = chat.length - 1; i >= 0; i--) {
-            const mid = getMesIdFromMsg(chat[i]);
-            if (mid === assistantMesId) {
-                assistantIdx = i;
+            if (chat[i]?.is_user) {
+                userIdx = i;
                 break;
             }
         }
-        let userIdx = -1;
-        if (assistantIdx !== -1) {
-            for (let i = assistantIdx - 1; i >= 0; i--) {
-                if (chat[i]?.is_user) {
-                    userIdx = i;
-                    break;
-                }
-            }
-        }
-
         if (userIdx === -1) {
-            log('Interceptor assistant lookup miss for key', keyToUse, 'assistantMesId', assistantMesId);
-
-            // Regeneration-like prompt shapes may omit assistant rows.
-            // Prefer patching the last user in these prompt types.
-            if (_type === 'swipe' || _type === 'regenerate' || _type === 'continue') {
-                for (let i = chat.length - 1; i >= 0; i--) {
-                    if (chat[i]?.is_user) {
-                        userIdx = i;
-                        log('Interceptor fallback selected last user idx', userIdx, 'for type', _type);
-                        break;
-                    }
-                }
-            }
-
-            // Safe fallback: patch the user immediately before the most recent assistant.
-            // This avoids rewriting a freshly-sent user message during normal generation.
-            let latestAssistantIdx = -1;
-            if (userIdx === -1) {
-                for (let i = chat.length - 1; i >= 0; i--) {
-                    const candidate = chat[i];
-                    if (candidate && !candidate.is_user && !candidate.is_system) {
-                        latestAssistantIdx = i;
-                        break;
-                    }
-                }
-            }
-
-            if (latestAssistantIdx !== -1) {
-                for (let i = latestAssistantIdx - 1; i >= 0; i--) {
-                    if (chat[i]?.is_user) {
-                        userIdx = i;
-                        log('Interceptor fallback selected user idx', userIdx, 'before assistant idx', latestAssistantIdx);
-                        break;
-                    }
-                }
-            }
-
-            // As a final fallback, try the last user for regeneration-like types.
-            if (userIdx === -1 && latestAssistantIdx === -1 && (_type === 'swipe' || _type === 'regenerate' || _type === 'continue')) {
-                for (let i = chat.length - 1; i >= 0; i--) {
-                    if (chat[i]?.is_user) {
-                        userIdx = i;
-                        log('Interceptor fallback selected last user idx', userIdx, 'for type', _type);
-                        break;
-                    }
-                }
-            }
+            abortInterceptor('target_user_not_found', { type: _type, keyToUse, chatLength: Array.isArray(chat) ? chat.length : null });
+            return;
         }
-        if (userIdx === -1) return;
+
+        log('Interceptor decision', { type: _type, keyToUse, resolvedUserIdx: userIdx });
 
         const msg = chat[userIdx];
+        if (!msg || typeof msg !== 'object') {
+            abortInterceptor('target_mismatch', { type: _type, keyToUse, resolvedUserIdx: userIdx });
+            return;
+        }
+
         // If already matching, skip
-        if (msg.mes === mappedTextStr) return;
+        if (msg.mes === mappedText) return;
 
         // Store only the original mes value for restore (safer than storing whole object)
         const originalMes = msg.mes;
@@ -1097,8 +1058,8 @@
         // Mutate the mes property directly instead of replacing the object.
         // This is safer because if ST modifies other properties during generation,
         // we won't lose those changes when we restore.
-        msg.mes = mappedTextStr;
-        log('Interceptor patched user msg idx', userIdx, 'with key', keyToUse, 'to:', mappedTextStr.substring(0, 60));
+        msg.mes = mappedText;
+        log('Interceptor patched user msg idx', userIdx, 'with key', keyToUse, 'to:', mappedText.substring(0, 60));
     };
 
     // ─── Delegated Click Handler ─────────────────────────────────────────────────
