@@ -10,13 +10,13 @@
     let observer = null;
     let isGenerating = false;
     let swipeDebounceTimer = null;
-    let interceptorRestore = null;
     let lastChatId = null;
     let hasMessageSwipedEvent = false; // True if MESSAGE_SWIPED event is available
     let generationKey = null; // Key captured at generation start for interceptor use
     let generationType = null; // Active generation type (normal/swipe/regenerate/continue/etc.)
     let didReceiveMessageForGeneration = false; // True once MESSAGE_RECEIVED arrives for current generation
     let pendingSwipeGenerationKey = null; // Previous swipe key captured before overswipe generation
+    let pendingGenerationType = null; // Preserved across GENERATION_ENDED for late MESSAGE_RECEIVED
     const MAX_MAP_ENTRIES = 100; // Safety limit for map size
     const mesElCache = new Map(); // mesId -> Element cache for getMesElByIndex
     let lastMesElCache = { user: null, assistant: null }; // cached results for getLastMesEl
@@ -165,7 +165,7 @@
         if (typeof currentUserText === 'string' && shouldBackfillSwipeMapping(userMsg, swipeId)) {
             const key = `${assistantMesId}:${swipeId}`;
             if (!map.has(key)) {
-                setMapping(assistantMesId, swipeId, currentUserText, { source: 'ensureMappingForAssistantMesId' });
+                setMapping(assistantMesId, swipeId, currentUserText, { setActive: true, source: 'ensureMappingForAssistantMesId' });
             }
         }
     }
@@ -661,6 +661,7 @@
         pendingUserText = null;
         generationKey = null;
         generationType = null;
+        pendingGenerationType = null;
         didReceiveMessageForGeneration = false;
         pendingSwipeGenerationKey = null;
         map.clear();
@@ -670,24 +671,7 @@
             clearTimeout(swipeDebounceTimer);
             swipeDebounceTimer = null;
         }
-        interceptorRestore = null;
         log('State cleared');
-    }
-
-    function restoreInterceptorPatch() {
-        if (!interceptorRestore) return;
-        const { chat, userIdx, originalMes } = interceptorRestore;
-        try {
-            // Only restore the mes property, not the entire object.
-            // This is safer as it avoids overwriting other properties ST may have modified.
-            if (chat && userIdx != null && userIdx >= 0 && chat[userIdx] && originalMes !== undefined) {
-                chat[userIdx].mes = originalMes;
-                log('Interceptor patch restored');
-            }
-        } catch (e) {
-            console.warn(`[${EXTENSION_NAME}] restore error:`, e);
-        }
-        interceptorRestore = null;
     }
 
     // ─── Event Handlers ──────────────────────────────────────────────────────────
@@ -714,9 +698,6 @@
     }
 
     function onChatChanged() {
-        // Restore any pending interceptor patch before clearing state
-        restoreInterceptorPatch();
-
         const ctx = SillyTavern.getContext();
         const currentId = ctx.chatId || null;
         if (currentId !== lastChatId) {
@@ -737,6 +718,7 @@
 
         isGenerating = true;
         generationType = typeof type === 'string' ? type : null;
+        pendingGenerationType = generationType;
         didReceiveMessageForGeneration = false;
 
         // For normal sends, ST appends the new user message later in the flow.
@@ -758,14 +740,6 @@
         pendingSwipeGenerationKey = null;
 
         log('GENERATION_AFTER_COMMANDS – pending:', pendingUserText && pendingUserText.substring(0, 60), 'key:', generationKey);
-
-        // Safety: restore after timeout if generation takes too long or events don't fire
-        setTimeout(() => {
-            if (interceptorRestore) {
-                log('Safety timeout: restoring interceptor patch');
-                restoreInterceptorPatch();
-            }
-        }, 60000); // 60 second safety
     }
 
     function onGenerationStarted(type, _generateOptions, dryRun) {
@@ -786,8 +760,11 @@
         const chat = ctx.chat;
         if (!chat || messageIndex == null) return;
 
-        // Ignore assistant inserts that are not part of the currently tracked generation.
-        if (!isGenerating || !shouldTrackGenerationType(generationType)) return;
+        // Use pendingGenerationType as fallback when GENERATION_ENDED fires before
+        // MESSAGE_RECEIVED (streaming path: markUIGenStopped → GENERATION_ENDED
+        // clears isGenerating before MESSAGE_RECEIVED is emitted).
+        const effectiveType = isGenerating ? generationType : pendingGenerationType;
+        if (!shouldTrackGenerationType(effectiveType)) return;
 
         const chatIndex = findChatIndexByMesId(messageIndex);
         if (chatIndex == null) return;
@@ -799,7 +776,7 @@
         if (!aiMes) return;
 
         let userTextForMapping = null;
-        if (generationType === 'normal') {
+        if (effectiveType === 'normal') {
             // For normal sends, use the user immediately before the received assistant.
             // This avoids stale pending text captured before ST appends the new user row.
             const userIdx = getUserIndexBefore(chatIndex);
@@ -820,6 +797,7 @@
         });
         if (!storedKey) return;
         didReceiveMessageForGeneration = true;
+        pendingGenerationType = null;
     }
 
     function onCharacterMessageRendered(messageIndex) {
@@ -844,7 +822,6 @@
         isGenerating = false;
         generationKey = null; // Clear the generation-specific key
         pendingSwipeGenerationKey = null;
-        restoreInterceptorPatch();
 
         if (!didReceiveMessageForGeneration && pendingUserText) {
             log('GENERATION_ENDED – no MESSAGE_RECEIVED for tracked generation; skipped fallback mapping write');
@@ -991,9 +968,6 @@
     globalThis.swipeLinkedUserEditInterceptor = async function (chat, _contextSize, _abort, _type) {
         if (_type !== 'swipe' && _type !== 'regenerate' && _type !== 'continue') return;
 
-        // Restore any previous patch first
-        if (interceptorRestore) restoreInterceptorPatch();
-
         const abortInterceptor = (reason, details = {}) => {
             log('Interceptor abort', reason, details);
             console.warn(`[${EXTENSION_NAME}] Interceptor aborted (${reason})`, details);
@@ -1013,6 +987,15 @@
         const m = /^([0-9]+):([0-9]+)$/.exec(keyToUse);
         if (!m) {
             abortInterceptor('invalid_key', { type: _type, keyToUse });
+            return;
+        }
+
+        // Validate key belongs to the current assistant message, not a previous turn
+        const keyAssistantMesId = Number(m[1]);
+        const lastAiIdx = getLastAssistantIndexFromChat();
+        const lastAiMesId = lastAiIdx != null ? getMesIdFromChatIndex(lastAiIdx) : null;
+        if (lastAiMesId != null && keyAssistantMesId !== lastAiMesId) {
+            log('Interceptor: key assistant', keyAssistantMesId, 'does not match last assistant', lastAiMesId, '— skipping patch');
             return;
         }
 
@@ -1051,13 +1034,9 @@
         // If already matching, skip
         if (msg.mes === mappedText) return;
 
-        // Store only the original mes value for restore (safer than storing whole object)
-        const originalMes = msg.mes;
-        interceptorRestore = { chat, userIdx, originalMes };
-
-        // Mutate the mes property directly instead of replacing the object.
-        // This is safer because if ST modifies other properties during generation,
-        // we won't lose those changes when we restore.
+        // coreChat contains spread-copied objects (SillyTavern's Generate builds coreChat
+        // via chat.filter().map(item => ({ ...item, mes: regexed }))), so this mutation
+        // only affects the API call. No restoration needed.
         msg.mes = mappedText;
         log('Interceptor patched user msg idx', userIdx, 'with key', keyToUse, 'to:', mappedText.substring(0, 60));
     };
