@@ -60,8 +60,8 @@ Debug logs are prefixed with `[swipe_linked_user_edit]`.
 
 ## How It Works (internals)
 
-1. `GENERATION_AFTER_COMMANDS` — snapshots user text for regeneration-like flows (`swipe`/`regenerate`/`continue`). For `normal` sends, mapping is resolved from chat adjacency when the assistant arrives.
-2. `MESSAGE_RECEIVED` — stores `assistantMesId:swipeId → userText` in a Map (using the assistant's preceding user row for normal sends).
+1. `GENERATION_AFTER_COMMANDS` — snapshots user text for regeneration-like flows (`swipe`/`regenerate`/`continue`) before prompt assembly.
+2. `MESSAGE_SENT` + `MESSAGE_RECEIVED` — for `normal` sends, captures the just-sent user text at `MESSAGE_SENT` and stores `assistantMesId:swipeId → userText` at `MESSAGE_RECEIVED` (with adjacency fallback if needed).
 3. Swipe detection (MutationObserver on assistant `.mes_text` + delegated click on `.swipe_left`/`.swipe_right`) triggers a lookup and DOM update.
-4. `generate_interceptor` — ephemerally patches `msg.mes` on the selected user message in the outgoing prompt array and restores it on `GENERATION_ENDED`.
-5. `CHAT_CHANGED` — clears all state. `MESSAGE_SENT` only clears the pending snapshot.
+4. `generate_interceptor` — ephemerally patches `msg.mes` on the selected user message in the outgoing prompt array. Patch precedence is `edited > generation-start snapshot > mapped swipe text` to avoid race-dependent stale prompts.
+5. `CHAT_CHANGED` — clears all state. No persistent chat mutation is performed by the interceptor.

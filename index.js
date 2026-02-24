@@ -17,6 +17,8 @@
     let didReceiveMessageForGeneration = false; // True once MESSAGE_RECEIVED arrives for current generation
     let pendingSwipeGenerationKey = null; // Previous swipe key captured before overswipe generation
     let pendingGenerationType = null; // Preserved across GENERATION_ENDED for late MESSAGE_RECEIVED
+    let pendingNormalUserText = null; // Snapshot from MESSAGE_SENT used for normal-send mapping
+    let pendingEditedUserText = null; // Explicit user edit to apply on next swipe-like generation
     const MAX_MAP_ENTRIES = 100; // Safety limit for map size
     const mesElCache = new Map(); // mesId -> Element cache for getMesElByIndex
     let lastMesElCache = { user: null, assistant: null }; // cached results for getLastMesEl
@@ -182,6 +184,8 @@
                 lastChatId,
                 isGenerating,
                 pendingUserText,
+                pendingNormalUserText,
+                pendingEditedUserText,
                 activeKey,
                 mapSize: map.size,
                 aiIdx,
@@ -659,6 +663,8 @@
         clearAnySwipeLinkedHighlight();
         activeKey = null;
         pendingUserText = null;
+        pendingNormalUserText = null;
+        pendingEditedUserText = null;
         generationKey = null;
         generationType = null;
         pendingGenerationType = null;
@@ -777,11 +783,16 @@
 
         let userTextForMapping = null;
         if (effectiveType === 'normal') {
-            // For normal sends, use the user immediately before the received assistant.
-            // This avoids stale pending text captured before ST appends the new user row.
-            const userIdx = getUserIndexBefore(chatIndex);
-            if (userIdx != null && typeof chat[userIdx]?.mes === 'string') {
-                userTextForMapping = chat[userIdx].mes;
+            // Prefer the text captured at MESSAGE_SENT. This avoids races where
+            // assistant MESSAGE_RECEIVED arrives before chat adjacency is finalized.
+            if (typeof pendingNormalUserText === 'string') {
+                userTextForMapping = pendingNormalUserText;
+            } else {
+                // Fallback: use the user immediately before the received assistant.
+                const userIdx = getUserIndexBefore(chatIndex);
+                if (userIdx != null && typeof chat[userIdx]?.mes === 'string') {
+                    userTextForMapping = chat[userIdx].mes;
+                }
             }
         } else if (typeof pendingUserText === 'string') {
             userTextForMapping = pendingUserText;
@@ -797,6 +808,11 @@
         });
         if (!storedKey) return;
         didReceiveMessageForGeneration = true;
+        if (effectiveType === 'normal') {
+            pendingNormalUserText = null;
+        } else {
+            pendingEditedUserText = null;
+        }
         pendingGenerationType = null;
     }
 
@@ -888,9 +904,21 @@
 
     function onMessageEdited(messageIndex) {
         messageIndex = normalizeMessageIndex(messageIndex);
+        const chat = SillyTavern.getContext().chat;
+        let isLastUserEdit = false;
+        if (chat && messageIndex != null) {
+            const editedIndex = findChatIndexByMesId(messageIndex);
+            const lastUserIndex = getLastUserIndexFromChat();
+            if (editedIndex != null && editedIndex === lastUserIndex && chat[editedIndex]?.is_user) {
+                isLastUserEdit = true;
+            }
+        }
         // Keep pending text in sync with the latest edit.
         // Prefer chat object for raw markdown; fall back to DOM textContent.
         pendingUserText = getLastUserMesFromChat() || getLastUserMesFromDom();
+        if (isLastUserEdit) {
+            pendingEditedUserText = typeof pendingUserText === 'string' ? pendingUserText : null;
+        }
         log('MESSAGE_EDITED – pending updated:', pendingUserText && pendingUserText.substring(0, 60));
     }
 
@@ -900,6 +928,8 @@
         map.clear();
         activeKey = null;
         generationKey = null;
+        pendingNormalUserText = null;
+        pendingEditedUserText = null;
         pendingSwipeGenerationKey = null;
         log('MESSAGE_DELETED – cleared mappings and rebuilding current state');
 
@@ -957,6 +987,24 @@
 
     function onMessageSent(messageIndex) {
         messageIndex = normalizeMessageIndex(messageIndex);
+        const chat = SillyTavern.getContext().chat;
+        let sentUserText = null;
+        if (chat && messageIndex != null) {
+            const chatIndex = findChatIndexByMesId(messageIndex);
+            if (chatIndex != null) {
+                const msg = chat[chatIndex];
+                if (msg?.is_user && typeof msg.mes === 'string') {
+                    sentUserText = msg.mes;
+                }
+            }
+        }
+        if (typeof sentUserText !== 'string') {
+            sentUserText = getLastUserMesFromChat() || getLastUserMesFromDom();
+        }
+        pendingNormalUserText = typeof sentUserText === 'string' ? sentUserText : null;
+        pendingEditedUserText = null;
+        log('MESSAGE_SENT – pending normal text:', pendingNormalUserText && pendingNormalUserText.substring(0, 60));
+
         // Preserve mappings so follow-up assistant generations can patch historical context.
         // Just clear any pending text from an in-flight capture.
         pendingUserText = null;
@@ -1009,6 +1057,16 @@
             abortInterceptor('target_mismatch', { type: _type, keyToUse });
             return;
         }
+        let textSource = 'mapped';
+        let textToPatch = mappedText;
+        if (typeof pendingUserText === 'string') {
+            textSource = 'pending';
+            textToPatch = pendingUserText;
+        }
+        if (typeof pendingEditedUserText === 'string') {
+            textSource = 'edited';
+            textToPatch = pendingEditedUserText;
+        }
 
         // For swipe-like prompt shapes, always patch the latest user row in interceptor chat.
         let userIdx = -1;
@@ -1023,7 +1081,7 @@
             return;
         }
 
-        log('Interceptor decision', { type: _type, keyToUse, resolvedUserIdx: userIdx });
+        log('Interceptor decision', { type: _type, keyToUse, source: textSource, resolvedUserIdx: userIdx });
 
         const msg = chat[userIdx];
         if (!msg || typeof msg !== 'object') {
@@ -1032,13 +1090,13 @@
         }
 
         // If already matching, skip
-        if (msg.mes === mappedText) return;
+        if (msg.mes === textToPatch) return;
 
         // coreChat contains spread-copied objects (SillyTavern's Generate builds coreChat
         // via chat.filter().map(item => ({ ...item, mes: regexed }))), so this mutation
         // only affects the API call. No restoration needed.
-        msg.mes = mappedText;
-        log('Interceptor patched user msg idx', userIdx, 'with key', keyToUse, 'to:', mappedText.substring(0, 60));
+        msg.mes = textToPatch;
+        log('Interceptor patched user msg idx', userIdx, 'with key', keyToUse, 'source', textSource, 'to:', textToPatch.substring(0, 60));
     };
 
     // ─── Delegated Click Handler ─────────────────────────────────────────────────
