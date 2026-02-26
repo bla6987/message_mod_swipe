@@ -274,8 +274,9 @@
             return null;
         };
 
+        // Rebuild entire cache in one pass instead of scanning all elements per-miss
         const els = document.querySelectorAll('#chat .mes');
-        for (let i = els.length - 1; i >= 0; i--) {
+        for (let i = 0; i < els.length; i++) {
             const el = els[i];
             const candidates = [
                 el.getAttribute('mesid'),
@@ -288,13 +289,15 @@
             ];
             for (const c of candidates) {
                 const n = normalizeId(c);
-                if (n === index) {
-                    mesElCache.set(index, el);
-                    return el;
+                if (n != null) {
+                    mesElCache.set(n, el);
+                    break; // first valid ID wins for this element
                 }
             }
         }
-        return null;
+        // Try cache again after rebuild
+        const rebuilt = mesElCache.get(index);
+        return (rebuilt && rebuilt.isConnected) ? rebuilt : null;
     }
 
     function getMesTextEl(mesEl) {
@@ -634,6 +637,12 @@
 
     function attachObserver() {
         detachObserver();
+        // Skip MutationObserver entirely when MESSAGE_SWIPED event is available
+        // This eliminates all MutationRecord marshalling overhead during streaming
+        if (hasMessageSwipedEvent) {
+            log('attachObserver: skipped (MESSAGE_SWIPED event available)');
+            return;
+        }
         const aiIdx = getLastAssistantIndexFromChat();
         const aiEl = (aiIdx != null ? getMesElByIndex(getMesIdFromChatIndex(aiIdx)) : null) || getLastMesEl(false);
         const textEl = getMesTextEl(aiEl);
@@ -642,8 +651,6 @@
             return;
         }
         observer = new MutationObserver((mutations) => {
-            // Only use MutationObserver for swipe detection if MESSAGE_SWIPED event is unavailable
-            if (hasMessageSwipedEvent) return;
             // Skip characterData-only mutations during streaming (text content updates, not swipes)
             const allCharacterData = mutations.every(m => m.type === 'characterData');
             if (allCharacterData) return;
