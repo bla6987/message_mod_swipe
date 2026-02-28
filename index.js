@@ -18,7 +18,8 @@
     let pendingSwipeGenerationKey = null; // Previous swipe key captured before overswipe generation
     let pendingGenerationType = null; // Preserved across GENERATION_ENDED for late MESSAGE_RECEIVED
     let pendingNormalUserText = null; // Snapshot from MESSAGE_SENT used for normal-send mapping
-    let pendingEditedUserText = null; // Explicit user edit to apply on next swipe-like generation
+    let pendingEditedEntry = null; // { key, text } bound to the swipe key where latest-user edit occurred
+    let generationContext = null; // { type, sourceKey, sourceAssistantMesId, sourceUserText, capturedAt }
     const MAX_MAP_ENTRIES = 100; // Safety limit for map size
     const mesElCache = new Map(); // mesId -> Element cache for getMesElByIndex
     let lastMesElCache = { user: null, assistant: null }; // cached results for getLastMesEl
@@ -72,6 +73,13 @@
         }
 
         return key;
+    }
+
+    function parseMappingKey(key) {
+        if (typeof key !== 'string') return null;
+        const m = /^([0-9]+):([0-9]+)$/.exec(key);
+        if (!m) return null;
+        return { assistantMesId: Number(m[1]), swipeId: Number(m[2]) };
     }
 
     function extractSwipeText(entry) {
@@ -185,7 +193,8 @@
                 isGenerating,
                 pendingUserText,
                 pendingNormalUserText,
-                pendingEditedUserText,
+                pendingEditedEntry,
+                generationContext,
                 activeKey,
                 mapSize: map.size,
                 aiIdx,
@@ -435,6 +444,157 @@
         return null;
     }
 
+    function getUserMesFromDomByMesId(mesId) {
+        if (mesId == null) return null;
+        const userEl = getMesElByIndex(mesId);
+        const textEl = getMesTextEl(userEl);
+        if (!textEl) return null;
+        return textEl.textContent;
+    }
+
+    function getUserMesForAssistantMesId(assistantMesId) {
+        if (!Number.isFinite(assistantMesId)) return null;
+        const chat = SillyTavern.getContext().chat;
+        if (!chat) return null;
+        const assistantIdx = findChatIndexByMesId(assistantMesId);
+        if (assistantIdx == null) return null;
+        const userIdx = getUserIndexBefore(assistantIdx);
+        if (userIdx == null) return null;
+        return typeof chat[userIdx]?.mes === 'string' ? chat[userIdx].mes : null;
+    }
+
+    function getUserMesForKey(key) {
+        const parsed = parseMappingKey(key);
+        if (!parsed) return null;
+        return getUserMesForAssistantMesId(parsed.assistantMesId);
+    }
+
+    function isSwipeLikeType(type) {
+        return type === 'swipe' || type === 'regenerate' || type === 'continue';
+    }
+
+    function normalizeGenerationEventType(type) {
+        if (typeof type !== 'string') return null;
+        const normalized = type.trim().toLowerCase();
+        if (!normalized) return null;
+        if (normalized === 'append' || normalized === 'appendfinal') return 'continue';
+        return normalized;
+    }
+
+    function resolveTrackedReceivedType(emittedType, fallbackType) {
+        const normalizedEmitted = normalizeGenerationEventType(emittedType);
+        if (normalizedEmitted) {
+            if (normalizedEmitted === 'command' || normalizedEmitted === 'first_message' || normalizedEmitted === 'extension') {
+                log('MESSAGE_RECEIVED – ignored non-generation type', normalizedEmitted);
+                return null;
+            }
+            if (shouldTrackGenerationType(normalizedEmitted)) {
+                return normalizedEmitted;
+            }
+            return null;
+        }
+
+        const normalizedFallback = normalizeGenerationEventType(fallbackType);
+        if (!normalizedFallback) return null;
+        if (!shouldTrackGenerationType(normalizedFallback)) return null;
+        return normalizedFallback;
+    }
+
+    function doesAssistantExistForMesId(assistantMesId) {
+        if (!Number.isFinite(assistantMesId)) return false;
+        const chat = SillyTavern.getContext().chat;
+        if (!chat) return false;
+        const assistantIdx = findChatIndexByMesId(assistantMesId);
+        if (assistantIdx == null) return false;
+        const msg = chat[assistantIdx];
+        return Boolean(msg && !msg.is_user && !msg.is_system);
+    }
+
+    function doesAssistantExistForKey(key) {
+        const parsed = parseMappingKey(key);
+        if (!parsed) return false;
+        return doesAssistantExistForMesId(parsed.assistantMesId);
+    }
+
+    function pruneMappingsForDeletedAssistants() {
+        let pruned = 0;
+        for (const key of Array.from(map.keys())) {
+            const parsed = parseMappingKey(key);
+            if (!parsed || !doesAssistantExistForMesId(parsed.assistantMesId)) {
+                map.delete(key);
+                pruned++;
+            }
+        }
+        if (pruned > 0) {
+            log('pruned stale mappings:', pruned);
+        }
+        return pruned;
+    }
+
+    function captureGenerationContext(type, { capturedAt = 'after_commands', overwrite = false } = {}) {
+        const normalizedType = normalizeGenerationEventType(type);
+
+        if (!isSwipeLikeType(normalizedType)) {
+            generationContext = {
+                type: normalizedType,
+                sourceKey: null,
+                sourceAssistantMesId: null,
+                sourceUserText: null,
+                capturedAt,
+            };
+            generationKey = null;
+            pendingUserText = null;
+            return generationContext;
+        }
+
+        if (!overwrite && generationContext && generationContext.type === normalizedType
+            && (generationContext.sourceKey || typeof generationContext.sourceUserText === 'string')) {
+            generationKey = generationContext.sourceKey;
+            if (typeof generationContext.sourceUserText === 'string') {
+                pendingUserText = generationContext.sourceUserText;
+            }
+            return generationContext;
+        }
+
+        refreshActiveKeyFromChat();
+        let sourceKey = activeKey;
+        if (normalizedType === 'swipe' && (!sourceKey || !map.has(sourceKey)) && pendingSwipeGenerationKey && map.has(pendingSwipeGenerationKey)) {
+            sourceKey = pendingSwipeGenerationKey;
+            log('captureGenerationContext – using pre-overswipe key', sourceKey, 'at', capturedAt);
+        }
+        pendingSwipeGenerationKey = null;
+
+        const parsed = parseMappingKey(sourceKey);
+        let sourceUserText = null;
+        if (pendingEditedEntry && sourceKey && pendingEditedEntry.key === sourceKey && typeof pendingEditedEntry.text === 'string') {
+            sourceUserText = pendingEditedEntry.text;
+        }
+        if (typeof sourceUserText !== 'string' && sourceKey) {
+            const mappedText = map.get(sourceKey);
+            if (typeof mappedText === 'string') {
+                sourceUserText = mappedText;
+            }
+        }
+        if (typeof sourceUserText !== 'string' && sourceKey) {
+            sourceUserText = getUserMesForKey(sourceKey);
+        }
+        if (typeof sourceUserText !== 'string') {
+            sourceUserText = getLastUserMesFromChat() || getLastUserMesFromDom();
+        }
+
+        generationContext = {
+            type: normalizedType,
+            sourceKey: sourceKey || null,
+            sourceAssistantMesId: parsed ? parsed.assistantMesId : null,
+            sourceUserText: typeof sourceUserText === 'string' ? sourceUserText : null,
+            capturedAt,
+        };
+
+        generationKey = generationContext.sourceKey;
+        pendingUserText = generationContext.sourceUserText;
+        return generationContext;
+    }
+
     // ─── Capture / Store ─────────────────────────────────────────────────────────
 
     /**
@@ -671,7 +831,8 @@
         activeKey = null;
         pendingUserText = null;
         pendingNormalUserText = null;
-        pendingEditedUserText = null;
+        pendingEditedEntry = null;
+        generationContext = null;
         generationKey = null;
         generationType = null;
         pendingGenerationType = null;
@@ -707,7 +868,9 @@
     }
 
     function shouldTrackGenerationType(type) {
-        return type !== 'quiet' && type !== 'impersonate';
+        const normalized = normalizeGenerationEventType(type);
+        if (!normalized) return false;
+        return normalized !== 'quiet' && normalized !== 'impersonate';
     }
 
     function onChatChanged() {
@@ -730,29 +893,24 @@
         if (!shouldTrackGenerationType(type)) return;
 
         isGenerating = true;
-        generationType = typeof type === 'string' ? type : null;
+        generationType = normalizeGenerationEventType(type);
         pendingGenerationType = generationType;
         didReceiveMessageForGeneration = false;
 
-        // For normal sends, ST appends the new user message later in the flow.
-        // Capturing here would snapshot the previous user turn and can pollute mappings.
         if (generationType === 'normal') {
-            pendingUserText = null;
+            captureGenerationContext(generationType, { capturedAt: 'after_commands', overwrite: true });
+        } else if (!generationContext || generationContext.type !== generationType
+            || (!generationContext.sourceKey && typeof generationContext.sourceUserText !== 'string')) {
+            captureGenerationContext(generationType, { capturedAt: 'after_commands', overwrite: false });
         } else {
-            // Snapshot the current last user message text (may be freshly edited)
-            pendingUserText = getLastUserMesFromChat() || getLastUserMesFromDom();
-        }
-
-        // Capture the key NOW before any state changes during generation
-        refreshActiveKeyFromChat();
-        generationKey = activeKey;
-        if (generationType === 'swipe' && (!generationKey || !map.has(generationKey)) && pendingSwipeGenerationKey && map.has(pendingSwipeGenerationKey)) {
-            generationKey = pendingSwipeGenerationKey;
-            log('GENERATION_AFTER_COMMANDS – using pre-overswipe key:', generationKey);
+            generationKey = generationContext.sourceKey;
+            if (typeof generationContext.sourceUserText === 'string') {
+                pendingUserText = generationContext.sourceUserText;
+            }
         }
         pendingSwipeGenerationKey = null;
 
-        log('GENERATION_AFTER_COMMANDS – pending:', pendingUserText && pendingUserText.substring(0, 60), 'key:', generationKey);
+        log('GENERATION_AFTER_COMMANDS – pending:', pendingUserText && pendingUserText.substring(0, 60), 'key:', generationKey, 'ctx:', generationContext);
     }
 
     function onGenerationStarted(type, _generateOptions, dryRun) {
@@ -760,14 +918,18 @@
         if (!shouldTrackGenerationType(type)) return;
 
         isGenerating = true;
-        generationType = typeof type === 'string' ? type : generationType;
+        generationType = normalizeGenerationEventType(type) || generationType;
+        pendingGenerationType = generationType;
         didReceiveMessageForGeneration = false;
-        if (!pendingUserText && generationType !== 'normal') {
-            pendingUserText = getLastUserMesFromChat() || getLastUserMesFromDom();
+        if (generationType === 'normal') {
+            captureGenerationContext(generationType, { capturedAt: 'started', overwrite: true });
+        } else {
+            captureGenerationContext(generationType, { capturedAt: 'started', overwrite: true });
         }
+        log('GENERATION_STARTED – pending:', pendingUserText && pendingUserText.substring(0, 60), 'key:', generationKey, 'ctx:', generationContext);
     }
 
-    function onMessageReceived(messageIndex) {
+    function onMessageReceived(messageIndex, messageType) {
         messageIndex = normalizeMessageIndex(messageIndex);
         const ctx = SillyTavern.getContext();
         const chat = ctx.chat;
@@ -775,9 +937,21 @@
 
         // Use pendingGenerationType as fallback when GENERATION_ENDED fires before
         // MESSAGE_RECEIVED (streaming path: markUIGenStopped → GENERATION_ENDED
-        // clears isGenerating before MESSAGE_RECEIVED is emitted).
-        const effectiveType = isGenerating ? generationType : pendingGenerationType;
-        if (!shouldTrackGenerationType(effectiveType)) return;
+        // can clear generating flags before MESSAGE_RECEIVED is emitted).
+        const fallbackType = isGenerating ? generationType : pendingGenerationType;
+        const normalizedFallbackType = normalizeGenerationEventType(fallbackType);
+        let effectiveType = resolveTrackedReceivedType(messageType, normalizedFallbackType);
+
+        // Regenerate can emit MESSAGE_RECEIVED as "normal" after deleting/replacing
+        // the assistant row. In that case preserve the original swipe-like type.
+        if (effectiveType === 'normal'
+            && isSwipeLikeType(normalizedFallbackType)
+            && generationContext
+            && generationContext.type === normalizedFallbackType) {
+            log('MESSAGE_RECEIVED – remapped emitted normal to', normalizedFallbackType, 'using generation context');
+            effectiveType = normalizedFallbackType;
+        }
+        if (!effectiveType) return;
 
         const chatIndex = findChatIndexByMesId(messageIndex);
         if (chatIndex == null) return;
@@ -788,6 +962,12 @@
         const aiMes = msg.mes;
         if (!aiMes) return;
 
+        const contextType = normalizeGenerationEventType(generationContext?.type);
+        const sourceKeyFromContext = generationContext
+            && (contextType === effectiveType || (isSwipeLikeType(contextType) && isSwipeLikeType(effectiveType)))
+            ? generationContext.sourceKey
+            : null;
+        const keyUsedForGeneration = sourceKeyFromContext || generationKey || activeKey;
         let userTextForMapping = null;
         if (effectiveType === 'normal') {
             // Prefer the text captured at MESSAGE_SENT. This avoids races where
@@ -801,8 +981,26 @@
                     userTextForMapping = chat[userIdx].mes;
                 }
             }
-        } else if (typeof pendingUserText === 'string') {
-            userTextForMapping = pendingUserText;
+        } else {
+            if (pendingEditedEntry && keyUsedForGeneration
+                && pendingEditedEntry.key === keyUsedForGeneration
+                && typeof pendingEditedEntry.text === 'string') {
+                userTextForMapping = pendingEditedEntry.text;
+            } else if (generationContext
+                && typeof generationContext.sourceUserText === 'string'
+                && (!generationContext.sourceKey || generationContext.sourceKey === keyUsedForGeneration)) {
+                userTextForMapping = generationContext.sourceUserText;
+            } else if (typeof pendingUserText === 'string') {
+                userTextForMapping = pendingUserText;
+            } else if (keyUsedForGeneration) {
+                const mappedText = map.get(keyUsedForGeneration);
+                if (typeof mappedText === 'string') {
+                    userTextForMapping = mappedText;
+                }
+            }
+            if (typeof userTextForMapping !== 'string') {
+                userTextForMapping = getLastUserMesFromDom() || null;
+            }
         }
 
         if (typeof userTextForMapping !== 'string') return;
@@ -818,8 +1016,13 @@
         if (effectiveType === 'normal') {
             pendingNormalUserText = null;
         } else {
-            pendingEditedUserText = null;
+            if (pendingEditedEntry && keyUsedForGeneration && pendingEditedEntry.key === keyUsedForGeneration) {
+                pendingEditedEntry = null;
+            }
         }
+        pendingUserText = null;
+        generationKey = null;
+        generationContext = null;
         pendingGenerationType = null;
     }
 
@@ -842,14 +1045,22 @@
     }
 
     function onGenerationEnded() {
+        const preserveForLateMessage = !didReceiveMessageForGeneration && shouldTrackGenerationType(pendingGenerationType);
+
         isGenerating = false;
-        generationKey = null; // Clear the generation-specific key
         pendingSwipeGenerationKey = null;
 
-        if (!didReceiveMessageForGeneration && pendingUserText) {
+        if (!didReceiveMessageForGeneration && !preserveForLateMessage && pendingUserText) {
             log('GENERATION_ENDED – no MESSAGE_RECEIVED for tracked generation; skipped fallback mapping write');
         }
-        pendingUserText = null;
+        if (preserveForLateMessage) {
+            log('GENERATION_ENDED – preserving context for late MESSAGE_RECEIVED', pendingGenerationType, generationKey);
+        } else {
+            pendingUserText = null;
+            generationKey = null;
+            generationContext = null;
+            pendingGenerationType = null;
+        }
         generationType = null;
         didReceiveMessageForGeneration = false;
     }
@@ -912,33 +1123,73 @@
     function onMessageEdited(messageIndex) {
         messageIndex = normalizeMessageIndex(messageIndex);
         const chat = SillyTavern.getContext().chat;
-        let isLastUserEdit = false;
-        if (chat && messageIndex != null) {
-            const editedIndex = findChatIndexByMesId(messageIndex);
-            const lastUserIndex = getLastUserIndexFromChat();
-            if (editedIndex != null && editedIndex === lastUserIndex && chat[editedIndex]?.is_user) {
-                isLastUserEdit = true;
-            }
+        if (!chat || messageIndex == null) return;
+
+        const editedIndex = findChatIndexByMesId(messageIndex);
+        const lastUserIndex = getLastUserIndexFromChat();
+        if (editedIndex == null || lastUserIndex == null) return;
+        if (editedIndex !== lastUserIndex || !chat[editedIndex]?.is_user) {
+            return; // Track only latest user/assistant turn pair.
         }
-        // Keep pending text in sync with the latest edit.
-        // Prefer chat object for raw markdown; fall back to DOM textContent.
-        pendingUserText = getLastUserMesFromChat() || getLastUserMesFromDom();
-        if (isLastUserEdit) {
-            pendingEditedUserText = typeof pendingUserText === 'string' ? pendingUserText : null;
+
+        refreshActiveKeyFromChat();
+        const keyAtEdit = activeKey;
+        if (!keyAtEdit) {
+            log('MESSAGE_EDITED – no active key, skipped keyed edit capture');
+            return;
         }
-        log('MESSAGE_EDITED – pending updated:', pendingUserText && pendingUserText.substring(0, 60));
+
+        let editedText = typeof chat[editedIndex]?.mes === 'string' ? chat[editedIndex].mes : null;
+        if (typeof editedText !== 'string') {
+            editedText = getUserMesFromDomByMesId(getMesIdFromChatIndex(editedIndex));
+        }
+        if (typeof editedText !== 'string') return;
+
+        pendingEditedEntry = { key: keyAtEdit, text: editedText };
+        log('MESSAGE_EDITED – pending keyed edit updated:', keyAtEdit, editedText.substring(0, 60));
     }
 
     function onMessageDeleted(_chatLength) {
         invalidateMesElCache();
         clearAnySwipeLinkedHighlight();
-        map.clear();
-        activeKey = null;
-        generationKey = null;
+
+        const normalizedType = normalizeGenerationEventType(generationType || pendingGenerationType || generationContext?.type);
+        const preserveGenerationState = isGenerating && isSwipeLikeType(normalizedType);
+
+        if (preserveGenerationState) {
+            log('MESSAGE_DELETED – preserving in-flight swipe-like generation state', normalizedType, generationKey, generationContext);
+            requestAnimationFrame(() => {
+                handleSwipeChange();
+            });
+            return;
+        }
+
+        const pruned = pruneMappingsForDeletedAssistants();
+
+        if (activeKey && !doesAssistantExistForKey(activeKey)) {
+            activeKey = null;
+        }
+        if (generationKey && !doesAssistantExistForKey(generationKey)) {
+            generationKey = null;
+        }
+        if (pendingSwipeGenerationKey && !doesAssistantExistForKey(pendingSwipeGenerationKey)) {
+            pendingSwipeGenerationKey = null;
+        }
+        if (pendingEditedEntry && typeof pendingEditedEntry.key === 'string' && !doesAssistantExistForKey(pendingEditedEntry.key)) {
+            pendingEditedEntry = null;
+        }
+        if (generationContext?.sourceKey && !doesAssistantExistForKey(generationContext.sourceKey)) {
+            generationContext = {
+                ...generationContext,
+                sourceKey: null,
+                sourceAssistantMesId: null,
+            };
+        }
+
         pendingNormalUserText = null;
-        pendingEditedUserText = null;
-        pendingSwipeGenerationKey = null;
-        log('MESSAGE_DELETED – cleared mappings and rebuilding current state');
+        pendingUserText = null;
+        pendingGenerationType = null;
+        log('MESSAGE_DELETED – pruned stale mappings and rebuilding current state', pruned);
 
         requestAnimationFrame(() => {
             captureCurrentState();
@@ -961,6 +1212,20 @@
         // 1. Delete the mapping for the removed swipe
         const deletedKey = `${assistantMesId}:${swipeId}`;
         map.delete(deletedKey);
+
+        if (pendingEditedEntry && typeof pendingEditedEntry.key === 'string') {
+            const parsed = parseMappingKey(pendingEditedEntry.key);
+            if (parsed && parsed.assistantMesId === assistantMesId) {
+                if (parsed.swipeId === swipeId) {
+                    pendingEditedEntry = null;
+                } else if (parsed.swipeId > swipeId) {
+                    pendingEditedEntry = {
+                        key: `${assistantMesId}:${parsed.swipeId - 1}`,
+                        text: pendingEditedEntry.text,
+                    };
+                }
+            }
+        }
 
         // 2. Shift all mappings above the deleted index down by 1
         const toRename = [];
@@ -1009,19 +1274,23 @@
             sentUserText = getLastUserMesFromChat() || getLastUserMesFromDom();
         }
         pendingNormalUserText = typeof sentUserText === 'string' ? sentUserText : null;
-        pendingEditedUserText = null;
+        pendingEditedEntry = null;
         log('MESSAGE_SENT – pending normal text:', pendingNormalUserText && pendingNormalUserText.substring(0, 60));
 
         // Preserve mappings so follow-up assistant generations can patch historical context.
         // Just clear any pending text from an in-flight capture.
         pendingUserText = null;
         pendingSwipeGenerationKey = null;
+        generationContext = null;
+        generationKey = null;
+        pendingGenerationType = null;
     }
 
     // ─── Generate Interceptor ────────────────────────────────────────────────────
 
     globalThis.swipeLinkedUserEditInterceptor = async function (chat, _contextSize, _abort, _type) {
-        if (_type !== 'swipe' && _type !== 'regenerate' && _type !== 'continue') return;
+        const interceptorType = normalizeGenerationEventType(_type);
+        if (interceptorType !== 'swipe' && interceptorType !== 'regenerate' && interceptorType !== 'continue') return;
 
         const abortInterceptor = (reason, details = {}) => {
             log('Interceptor abort', reason, details);
@@ -1033,46 +1302,57 @@
 
         // Use the key captured at generation start, not current state
         // This avoids race conditions where swipe_id may have changed
-        const keyToUse = generationKey || activeKey;
+        const keyToUse = generationContext?.sourceKey || generationKey || activeKey;
         if (!keyToUse) {
-            abortInterceptor('missing_key', { type: _type });
+            abortInterceptor('missing_key', { type: interceptorType });
             return;
         }
 
-        const m = /^([0-9]+):([0-9]+)$/.exec(keyToUse);
-        if (!m) {
-            abortInterceptor('invalid_key', { type: _type, keyToUse });
+        const parsedKey = parseMappingKey(keyToUse);
+        if (!parsedKey) {
+            abortInterceptor('invalid_key', { type: interceptorType, keyToUse });
             return;
         }
 
-        // Validate key belongs to the current assistant message, not a previous turn
-        const keyAssistantMesId = Number(m[1]);
+        // Validate key belongs to the current assistant message for types that
+        // keep the assistant row in place (swipe/continue). Regenerate can
+        // delete the source assistant before interceptors run.
+        const keyAssistantMesId = parsedKey.assistantMesId;
         const lastAiIdx = getLastAssistantIndexFromChat();
         const lastAiMesId = lastAiIdx != null ? getMesIdFromChatIndex(lastAiIdx) : null;
-        if (lastAiMesId != null && keyAssistantMesId !== lastAiMesId) {
-            log('Interceptor: key assistant', keyAssistantMesId, 'does not match last assistant', lastAiMesId, '— skipping patch');
-            return;
+        const requireAssistantMatch = interceptorType === 'swipe' || interceptorType === 'continue';
+        if (requireAssistantMatch) {
+            if (lastAiMesId != null && keyAssistantMesId !== lastAiMesId) {
+                log('Interceptor: key assistant', keyAssistantMesId, 'does not match last assistant', lastAiMesId, '— skipping patch');
+                return;
+            }
+        } else if (interceptorType === 'regenerate' && lastAiMesId != null && keyAssistantMesId !== lastAiMesId) {
+            log('Interceptor: allowing regenerate key assistant mismatch', keyAssistantMesId, lastAiMesId);
         }
 
-        if (!map.has(keyToUse)) {
-            abortInterceptor('missing_map', { type: _type, keyToUse });
-            return;
-        }
-
-        const mappedText = map.get(keyToUse);
-        if (typeof mappedText !== 'string') {
-            abortInterceptor('target_mismatch', { type: _type, keyToUse });
-            return;
-        }
-        let textSource = 'mapped';
-        let textToPatch = mappedText;
-        if (typeof pendingUserText === 'string') {
+        let textSource = null;
+        let textToPatch = null;
+        if (pendingEditedEntry && pendingEditedEntry.key === keyToUse && typeof pendingEditedEntry.text === 'string') {
+            textSource = 'edited';
+            textToPatch = pendingEditedEntry.text;
+        } else if (generationContext
+            && typeof generationContext.sourceUserText === 'string'
+            && (!generationContext.sourceKey || generationContext.sourceKey === keyToUse)) {
+            textSource = 'context';
+            textToPatch = generationContext.sourceUserText;
+        } else if (typeof pendingUserText === 'string') {
             textSource = 'pending';
             textToPatch = pendingUserText;
+        } else {
+            const mappedText = map.get(keyToUse);
+            if (typeof mappedText === 'string') {
+                textSource = 'mapped';
+                textToPatch = mappedText;
+            }
         }
-        if (typeof pendingEditedUserText === 'string') {
-            textSource = 'edited';
-            textToPatch = pendingEditedUserText;
+        if (typeof textToPatch !== 'string') {
+            abortInterceptor('missing_text', { type: interceptorType, keyToUse });
+            return;
         }
 
         // For swipe-like prompt shapes, always patch the latest user row in interceptor chat.
@@ -1084,15 +1364,15 @@
             }
         }
         if (userIdx === -1) {
-            abortInterceptor('target_user_not_found', { type: _type, keyToUse, chatLength: Array.isArray(chat) ? chat.length : null });
+            abortInterceptor('target_user_not_found', { type: interceptorType, keyToUse, chatLength: Array.isArray(chat) ? chat.length : null });
             return;
         }
 
-        log('Interceptor decision', { type: _type, keyToUse, source: textSource, resolvedUserIdx: userIdx });
+        log('Interceptor decision', { type: interceptorType, keyToUse, source: textSource, resolvedUserIdx: userIdx });
 
         const msg = chat[userIdx];
         if (!msg || typeof msg !== 'object') {
-            abortInterceptor('target_mismatch', { type: _type, keyToUse, resolvedUserIdx: userIdx });
+            abortInterceptor('target_mismatch', { type: interceptorType, keyToUse, resolvedUserIdx: userIdx });
             return;
         }
 
@@ -1222,10 +1502,26 @@
         init();
     }
 
+    async function bootWithRuntimeBus() {
+        const runtimeBus = globalThis.STRuntimeBus;
+        if (!runtimeBus?.waitForContext) {
+            boot();
+            return;
+        }
+
+        try {
+            await runtimeBus.waitForContext({ timeoutMs: 10000 });
+            init();
+        } catch (error) {
+            console.warn(`[${EXTENSION_NAME}] Runtime bus context wait failed; falling back to local boot`, error);
+            boot();
+        }
+    }
+
     // Run init once DOM is ready
     if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', boot);
+        document.addEventListener('DOMContentLoaded', bootWithRuntimeBus);
     } else {
-        boot();
+        bootWithRuntimeBus();
     }
 })();
