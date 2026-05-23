@@ -218,6 +218,66 @@
         lastMesElCache.assistant = null;
     }
 
+    function normalizeMessageDomId(v) {
+        if (v == null) return null;
+        if (typeof v === 'number') return v;
+        if (typeof v === 'string') {
+            const s = v.trim();
+            if (s === '') return null;
+            if (!Number.isNaN(Number(s)) && /^[0-9]+$/.test(s)) return Number(s);
+            const m = s.match(/([0-9]+)$/);
+            if (m && !Number.isNaN(Number(m[1]))) return Number(m[1]);
+        }
+        return null;
+    }
+
+    function getMesIdsFromElement(el) {
+        if (!el) return [];
+        const candidates = [
+            el.getAttribute('mesid'),
+            el.getAttribute('data-mesid'),
+            el.getAttribute('data-message-id'),
+            el.dataset?.mesid,
+            el.dataset?.mesId,
+            el.dataset?.messageId,
+            el.id,
+        ];
+        const ids = [];
+        for (const candidate of candidates) {
+            const id = normalizeMessageDomId(candidate);
+            if (id != null && !ids.includes(id)) {
+                ids.push(id);
+            }
+        }
+        return ids;
+    }
+
+    function getChatIndexForMesEl(el) {
+        for (const id of getMesIdsFromElement(el)) {
+            const chatIndex = findChatIndexByMesId(id);
+            if (chatIndex != null) return chatIndex;
+        }
+        return null;
+    }
+
+    function getMesElForChatIndex(chatIndex) {
+        if (chatIndex == null || chatIndex < 0) return null;
+
+        const candidateIds = [];
+        const mesId = getMesIdFromChatIndex(chatIndex);
+        if (mesId != null) candidateIds.push(mesId);
+        if (!candidateIds.includes(chatIndex)) candidateIds.push(chatIndex);
+
+        for (const id of candidateIds) {
+            const el = getMesElByIndex(id);
+            if (el && getChatIndexForMesEl(el) === chatIndex) {
+                return el;
+            }
+        }
+
+        return null;
+    }
+
     function getLastMesEl(isUser) {
         const cacheKey = isUser ? 'user' : 'assistant';
         if (lastMesElCache[cacheKey] && lastMesElCache[cacheKey].isConnected) {
@@ -270,38 +330,13 @@
             }
         }
 
-        const normalizeId = (v) => {
-            if (v == null) return null;
-            if (typeof v === 'number') return v;
-            if (typeof v === 'string') {
-                const s = v.trim();
-                if (s === '') return null;
-                if (!Number.isNaN(Number(s)) && /^[0-9]+$/.test(s)) return Number(s);
-                const m = s.match(/([0-9]+)$/);
-                if (m && !Number.isNaN(Number(m[1]))) return Number(m[1]);
-            }
-            return null;
-        };
-
         // Rebuild entire cache in one pass instead of scanning all elements per-miss
         const els = document.querySelectorAll('#chat .mes');
         for (let i = 0; i < els.length; i++) {
             const el = els[i];
-            const candidates = [
-                el.getAttribute('mesid'),
-                el.getAttribute('data-mesid'),
-                el.getAttribute('data-message-id'),
-                el.dataset?.mesid,
-                el.dataset?.mesId,
-                el.dataset?.messageId,
-                el.id,
-            ];
-            for (const c of candidates) {
-                const n = normalizeId(c);
-                if (n != null) {
-                    mesElCache.set(n, el);
-                    break; // first valid ID wins for this element
-                }
+            const ids = getMesIdsFromElement(el);
+            if (ids.length) {
+                mesElCache.set(ids[0], el); // first valid ID wins for this element
             }
         }
         // Try cache again after rebuild
@@ -656,8 +691,9 @@
             return;
         }
 
-        const userEl = getMesElByIndex(getMesIdFromChatIndex(userIndex)) || getLastMesEl(true);
+        const userEl = getMesElForChatIndex(userIndex);
         if (!userEl) {
+            log('Could not resolve exact user message DOM element for index', userIndex);
             clearAnySwipeLinkedHighlight();
             return;
         }
@@ -709,9 +745,9 @@
             return;
         }
 
-        const userEl = getMesElByIndex(getMesIdFromChatIndex(userIndex)) || getLastMesEl(true);
+        const userEl = getMesElForChatIndex(userIndex);
         if (!userEl) {
-            log('Could not resolve user message DOM element for index', userIndex);
+            log('Could not resolve exact user message DOM element for index', userIndex);
             clearAnySwipeLinkedHighlight();
             return;
         }
@@ -1292,25 +1328,21 @@
         const interceptorType = normalizeGenerationEventType(_type);
         if (interceptorType !== 'swipe' && interceptorType !== 'regenerate' && interceptorType !== 'continue') return;
 
-        const abortInterceptor = (reason, details = {}) => {
-            log('Interceptor abort', reason, details);
-            console.warn(`[${EXTENSION_NAME}] Interceptor aborted (${reason})`, details);
-            if (typeof _abort === 'function') {
-                _abort(true);
-            }
+        const skipPatch = (reason, details = {}) => {
+            log('Interceptor skipped', reason, details);
         };
 
         // Use the key captured at generation start, not current state
         // This avoids race conditions where swipe_id may have changed
         const keyToUse = generationContext?.sourceKey || generationKey || activeKey;
         if (!keyToUse) {
-            abortInterceptor('missing_key', { type: interceptorType });
+            skipPatch('missing_key', { type: interceptorType });
             return;
         }
 
         const parsedKey = parseMappingKey(keyToUse);
         if (!parsedKey) {
-            abortInterceptor('invalid_key', { type: interceptorType, keyToUse });
+            skipPatch('invalid_key', { type: interceptorType, keyToUse });
             return;
         }
 
@@ -1351,7 +1383,7 @@
             }
         }
         if (typeof textToPatch !== 'string') {
-            abortInterceptor('missing_text', { type: interceptorType, keyToUse });
+            skipPatch('missing_text', { type: interceptorType, keyToUse });
             return;
         }
 
@@ -1364,7 +1396,7 @@
             }
         }
         if (userIdx === -1) {
-            abortInterceptor('target_user_not_found', { type: interceptorType, keyToUse, chatLength: Array.isArray(chat) ? chat.length : null });
+            skipPatch('target_user_not_found', { type: interceptorType, keyToUse, chatLength: Array.isArray(chat) ? chat.length : null });
             return;
         }
 
@@ -1372,7 +1404,7 @@
 
         const msg = chat[userIdx];
         if (!msg || typeof msg !== 'object') {
-            abortInterceptor('target_mismatch', { type: interceptorType, keyToUse, resolvedUserIdx: userIdx });
+            skipPatch('target_mismatch', { type: interceptorType, keyToUse, resolvedUserIdx: userIdx });
             return;
         }
 
