@@ -6,7 +6,6 @@
     // ─── State ────────────────────────────────────────────────────────────────────
     let activeKey = null;
     let pendingUserText = null;
-    const map = new Map(); // `${assistantMesId}:${swipeId}` -> userText
     let observer = null;
     let isGenerating = false;
     let swipeDebounceTimer = null;
@@ -20,7 +19,7 @@
     let pendingNormalUserText = null; // Snapshot from MESSAGE_SENT used for normal-send mapping
     let pendingEditedEntry = null; // { key, text } bound to the swipe key where latest-user edit occurred
     let generationContext = null; // { type, sourceKey, sourceAssistantMesId, sourceUserText, capturedAt }
-    const MAX_MAP_ENTRIES = 100; // Safety limit for map size
+    let generationSeq = 0; // Guards delayed cleanup from previous generation lifecycles
     const mesElCache = new Map(); // mesId -> Element cache for getMesElByIndex
     let lastMesElCache = { user: null, assistant: null }; // cached results for getLastMesEl
     const eventSubscriptions = [];
@@ -43,35 +42,24 @@
         }
     }
 
-    function setMapping(assistantMesId, swipeId, userText, { setActive = false, source = '' } = {}) {
+    function setMapping(assistantMesId, swipeId, userText, { setActive = false, source = '', skipSave = false, confirm = false } = {}) {
         if (!Number.isFinite(assistantMesId) || !Number.isFinite(swipeId)) return null;
         if (typeof userText !== 'string') return null;
 
         const key = `${assistantMesId}:${swipeId}`;
-        map.set(key, userText);
-
-        let evicted = 0;
-        while (map.size > MAX_MAP_ENTRIES) {
-            const oldestKey = map.keys().next().value;
-            if (typeof oldestKey !== 'string') break;
-            map.delete(oldestKey);
-            if (activeKey === oldestKey && !setActive) {
-                activeKey = null;
-            }
-            evicted++;
-        }
+        const assistantMsg = resolveAssistantMsg(assistantMesId);
+        const wrote = assistantMsg ? setLinkedUserText(assistantMsg, swipeId, userText) : false;
 
         if (setActive) {
-            activeKey = map.has(key) ? key : null;
+            activeKey = key;
         }
 
         if (source) {
-            log(source, 'stored mapping', key, '->', userText.substring(0, 60));
-        }
-        if (evicted > 0) {
-            log('setMapping evicted', evicted, 'old map entries');
+            log(source, wrote ? 'stored linked text' : 'queued linked text', key, '->', userText.substring(0, 60));
         }
 
+        if (confirm) confirmLinkedUserText(assistantMesId, swipeId, userText);
+        if (wrote && !skipSave) requestChatSave();
         return key;
     }
 
@@ -80,6 +68,112 @@
         const m = /^([0-9]+):([0-9]+)$/.exec(key);
         if (!m) return null;
         return { assistantMesId: Number(m[1]), swipeId: Number(m[2]) };
+    }
+
+    function resolveAssistantMsg(mesIdOrIdx) {
+        const ctx = globalThis.SillyTavern?.getContext?.();
+        const chat = ctx?.chat;
+        if (!chat || mesIdOrIdx == null) return null;
+
+        let chatIndex = findChatIndexByMesId(mesIdOrIdx);
+        if (chatIndex == null && typeof mesIdOrIdx === 'number' && mesIdOrIdx >= 0 && mesIdOrIdx < chat.length) {
+            chatIndex = mesIdOrIdx;
+        }
+        const msg = chatIndex != null ? chat[chatIndex] : null;
+        return msg && !msg.is_user && !msg.is_system ? msg : null;
+    }
+
+    function getLinkedUserText(assistantMsg, swipeId = null) {
+        if (!assistantMsg) return null;
+        if (swipeId == null) {
+            const activeText = assistantMsg.extra?.linked_user_text;
+            return typeof activeText === 'string' ? activeText : null;
+        }
+        const linkedText = assistantMsg.swipe_info?.[swipeId]?.extra?.linked_user_text;
+        if (typeof linkedText === 'string') return linkedText;
+        const activeSwipeId = typeof assistantMsg.swipe_id === 'number' ? assistantMsg.swipe_id : 0;
+        if (swipeId === activeSwipeId && typeof assistantMsg.extra?.linked_user_text === 'string') {
+            return assistantMsg.extra.linked_user_text;
+        }
+        return null;
+    }
+
+    function setLinkedUserText(assistantMsg, swipeId, userText) {
+        if (!assistantMsg || !Number.isFinite(swipeId) || typeof userText !== 'string') return false;
+
+        let wrote = false;
+        if (assistantMsg.swipe_info?.[swipeId]) {
+            if (!assistantMsg.swipe_info[swipeId].extra || typeof assistantMsg.swipe_info[swipeId].extra !== 'object') {
+                assistantMsg.swipe_info[swipeId].extra = {};
+            }
+            assistantMsg.swipe_info[swipeId].extra.linked_user_text = userText;
+            wrote = true;
+        }
+
+        const activeSwipeId = typeof assistantMsg.swipe_id === 'number' ? assistantMsg.swipe_id : 0;
+        if (swipeId === activeSwipeId) {
+            if (!assistantMsg.extra || typeof assistantMsg.extra !== 'object') {
+                assistantMsg.extra = {};
+            }
+            assistantMsg.extra.linked_user_text = userText;
+            wrote = true;
+        }
+
+        return wrote;
+    }
+
+    function confirmLinkedUserText(assistantMesId, swipeId, userText) {
+        const chatIdAtSchedule = lastChatId;
+        const msgAtSchedule = resolveAssistantMsg(assistantMesId);
+        const doConfirm = () => {
+            if (lastChatId !== chatIdAtSchedule) return;
+            const assistantMsg = resolveAssistantMsg(assistantMesId);
+            if (!assistantMsg || assistantMsg !== msgAtSchedule) return;
+            if (setLinkedUserText(assistantMsg, swipeId, userText)) {
+                requestChatSave();
+            }
+        };
+
+        if (typeof requestAnimationFrame === 'function') {
+            requestAnimationFrame(() => setTimeout(doConfirm, 0));
+        } else {
+            setTimeout(doConfirm, 0);
+        }
+    }
+
+    function hasLinkedUserText(assistantMsg, swipeId = null) {
+        return typeof getLinkedUserText(assistantMsg, swipeId) === 'string';
+    }
+
+    function getLinkedTextByKey(key) {
+        const parsed = parseMappingKey(key);
+        if (!parsed) return null;
+        return getLinkedUserText(resolveAssistantMsg(parsed.assistantMesId), parsed.swipeId);
+    }
+
+    function hasLinkedTextByKey(key) {
+        return typeof getLinkedTextByKey(key) === 'string';
+    }
+
+    function requestChatSave() {
+        const ctx = globalThis.SillyTavern?.getContext?.();
+        try {
+            if (typeof ctx?.saveChatDebounced === 'function') {
+                ctx.saveChatDebounced();
+            } else if (typeof ctx?.saveChat === 'function') {
+                ctx.saveChat();
+            }
+        } catch (e) {
+            console.warn(`[${EXTENSION_NAME}] Failed to request chat save`, e);
+        }
+    }
+
+    function adjustKeyAfterSwipeDelete(key, assistantMesId, deletedSwipeId) {
+        const parsed = parseMappingKey(key);
+        if (!parsed || parsed.assistantMesId !== assistantMesId) return key;
+        if (parsed.swipeId === deletedSwipeId) return null;
+        if (parsed.swipeId > deletedSwipeId) return `${assistantMesId}:${parsed.swipeId - 1}`;
+        return key;
     }
 
     function extractSwipeText(entry) {
@@ -91,6 +185,16 @@
             if (typeof entry.content === 'string') return entry.content;
         }
         return null;
+    }
+
+    function hasAssistantContent(msg) {
+        if (!msg || msg.is_user || msg.is_system) return false;
+        if (typeof msg.mes === 'string' && msg.mes.trim() !== '') return true;
+        if (!Array.isArray(msg.swipes)) return false;
+        return msg.swipes.some((swipe) => {
+            const text = extractSwipeText(swipe);
+            return typeof text === 'string' && text.trim() !== '';
+        });
     }
 
     function formatUserMessageText(rawText, chatIndex) {
@@ -135,17 +239,6 @@
         textEl.innerHTML = formatUserMessageText(rawText, chatIndex);
     }
 
-    function getOriginalUserTextFromMsg(userMsg) {
-        if (!userMsg) return null;
-        if (Array.isArray(userMsg.swipes) && userMsg.swipes.length) {
-            for (let i = 0; i < userMsg.swipes.length; i++) {
-                const t = extractSwipeText(userMsg.swipes[i]);
-                if (typeof t === 'string' && t.trim() !== '') return t;
-            }
-        }
-        return typeof userMsg.mes === 'string' ? userMsg.mes : null;
-    }
-
     function ensureMappingForAssistantMesId(assistantMesId) {
         const ctx = SillyTavern.getContext();
         const chat = ctx.chat;
@@ -158,26 +251,11 @@
 
         const userIdx = getUserIndexBefore(aiIdx);
         if (userIdx == null) return;
-        const userMsg = chat[userIdx];
 
-        // Always try to ensure swipe 0 has a mapping (original variant).
-        const originalUserText = getOriginalUserTextFromMsg(userMsg);
-        if (typeof originalUserText === 'string') {
-            const key0 = `${assistantMesId}:0`;
-            if (!map.has(key0)) {
-                setMapping(assistantMesId, 0, originalUserText, { source: 'ensureMappingForAssistantMesId' });
-            }
-        }
-
-        // Also ensure mapping for the currently selected assistant swipe.
+        // Backfill must not create persisted metadata. Only ground-truth
+        // generation completion writes linked_user_text.
         const swipeId = resolveSwipeId(assistantMesId, aiMsg);
-        const currentUserText = typeof userMsg?.mes === 'string' ? userMsg.mes : originalUserText;
-        if (typeof currentUserText === 'string' && shouldBackfillSwipeMapping(userMsg, swipeId)) {
-            const key = `${assistantMesId}:${swipeId}`;
-            if (!map.has(key)) {
-                setMapping(assistantMesId, swipeId, currentUserText, { setActive: true, source: 'ensureMappingForAssistantMesId' });
-            }
-        }
+        activeKey = `${assistantMesId}:${swipeId}`;
     }
 
     globalThis.swipeLinkedUserEditDebug = function () {
@@ -196,7 +274,7 @@
                 pendingEditedEntry,
                 generationContext,
                 activeKey,
-                mapSize: map.size,
+                linkedUserText: activeKey ? getLinkedTextByKey(activeKey) : null,
                 aiIdx,
                 userIdx,
                 aiMsg: aiIdx != null && chat ? chat[aiIdx] : null,
@@ -370,27 +448,15 @@
         return 0;
     }
 
-    function shouldBackfillSwipeMapping(_userMsg, _swipeId) {
-        // Always allow backfill for any swipeId we don't have a mapping for.
-        // The existence check happens at call sites (map.has(key)).
-        // Previous logic incorrectly conflated user message swipes with assistant swipe mappings.
-        return true;
-    }
-
     /**
      * Get the swipe ID from a message object.
      * Prefer swipe_id because it tracks the currently selected swipe.
      * Fall back to swipes length only when swipe_id is unavailable.
      */
     function getSwipeIdFromMsg(msg) {
-        // Prefer the active swipe pointer first.
         if (typeof msg?.swipe_id === 'number') {
-            if (Array.isArray(msg?.swipes) && msg.swipes.length > 0) {
-                return Math.max(0, Math.min(msg.swipes.length - 1, msg.swipe_id));
-            }
             return Math.max(0, msg.swipe_id);
         }
-        // Fall back to the last known swipe when swipe_id is unavailable.
         if (Array.isArray(msg?.swipes) && msg.swipes.length > 0) {
             return msg.swipes.length - 1;
         }
@@ -551,21 +617,6 @@
         return doesAssistantExistForMesId(parsed.assistantMesId);
     }
 
-    function pruneMappingsForDeletedAssistants() {
-        let pruned = 0;
-        for (const key of Array.from(map.keys())) {
-            const parsed = parseMappingKey(key);
-            if (!parsed || !doesAssistantExistForMesId(parsed.assistantMesId)) {
-                map.delete(key);
-                pruned++;
-            }
-        }
-        if (pruned > 0) {
-            log('pruned stale mappings:', pruned);
-        }
-        return pruned;
-    }
-
     function captureGenerationContext(type, { capturedAt = 'after_commands', overwrite = false } = {}) {
         const normalizedType = normalizeGenerationEventType(type);
 
@@ -591,10 +642,23 @@
             return generationContext;
         }
 
-        refreshActiveKeyFromChat();
+        const refreshHint = parseMappingKey(activeKey)?.assistantMesId ?? generationContext?.sourceAssistantMesId ?? null;
+        refreshActiveKeyFromChat(refreshHint);
         let sourceKey = activeKey;
-        if (normalizedType === 'swipe' && (!sourceKey || !map.has(sourceKey)) && pendingSwipeGenerationKey && map.has(pendingSwipeGenerationKey)) {
+        if (pendingEditedEntry?.key) {
+            const pendingParsed = parseMappingKey(pendingEditedEntry.key);
+            const activeParsed = parseMappingKey(activeKey);
+            if (pendingParsed && activeParsed && pendingParsed.assistantMesId === activeParsed.assistantMesId) {
+                sourceKey = pendingEditedEntry.key;
+            } else if (!pendingParsed || !doesAssistantExistForMesId(pendingParsed.assistantMesId)) {
+                log('captureGenerationContext – discarding stale pendingEditedEntry', pendingEditedEntry.key);
+                pendingEditedEntry = null;
+            }
+        }
+        let usedOverswipeKey = null;
+        if (normalizedType === 'swipe' && (!sourceKey || !hasLinkedTextByKey(sourceKey)) && pendingSwipeGenerationKey && hasLinkedTextByKey(pendingSwipeGenerationKey)) {
             sourceKey = pendingSwipeGenerationKey;
+            usedOverswipeKey = pendingSwipeGenerationKey;
             log('captureGenerationContext – using pre-overswipe key', sourceKey, 'at', capturedAt);
         }
         pendingSwipeGenerationKey = null;
@@ -605,7 +669,7 @@
             sourceUserText = pendingEditedEntry.text;
         }
         if (typeof sourceUserText !== 'string' && sourceKey) {
-            const mappedText = map.get(sourceKey);
+            const mappedText = getLinkedTextByKey(sourceKey);
             if (typeof mappedText === 'string') {
                 sourceUserText = mappedText;
             }
@@ -623,6 +687,7 @@
             sourceAssistantMesId: parsed ? parsed.assistantMesId : null,
             sourceUserText: typeof sourceUserText === 'string' ? sourceUserText : null,
             capturedAt,
+            _usedOverswipeKey: usedOverswipeKey,
         };
 
         generationKey = generationContext.sourceKey;
@@ -633,36 +698,20 @@
     // ─── Capture / Store ─────────────────────────────────────────────────────────
 
     /**
-     * Capture the initial mapping for the current pair so that the "before-edit"
-     * variant is also tracked even if no generation happened while the ext was loaded.
+     * Capture the visible assistant/swipe key without backfilling persisted data.
      */
     function captureCurrentState() {
         const aiIdx = getLastAssistantIndexFromChat();
         const chat = SillyTavern.getContext().chat;
         const aiMsg = aiIdx != null && chat ? chat[aiIdx] : null;
-        const userIdx = getUserIndexBefore(aiIdx);
-        const userMsg = userIdx != null && chat ? chat[userIdx] : null;
-        const userMes = typeof userMsg?.mes === 'string' ? userMsg.mes : null;
-        if (typeof userMes !== 'string' || !aiMsg) return;
+        if (!aiMsg || aiMsg.is_user || aiMsg.is_system || !hasAssistantContent(aiMsg)) {
+            activeKey = null;
+            return;
+        }
 
         const assistantMesId = getMesIdFromChatIndex(aiIdx);
         const swipeId = resolveSwipeId(assistantMesId, aiMsg);
-        const key = `${assistantMesId}:${swipeId}`;
-        activeKey = key;
-        if (shouldBackfillSwipeMapping(userMsg, swipeId)) {
-            if (!map.has(key)) {
-                setMapping(assistantMesId, swipeId, userMes, { setActive: true, source: 'captureCurrentState' });
-            }
-        }
-
-        // Also backfill original swipe 0 mapping if possible.
-        const originalUserText = getOriginalUserTextFromMsg(userMsg);
-        if (typeof originalUserText === 'string') {
-            const key0 = `${assistantMesId}:0`;
-            if (!map.has(key0)) {
-                setMapping(assistantMesId, 0, originalUserText, { source: 'captureCurrentState' });
-            }
-        }
+        activeKey = `${assistantMesId}:${swipeId}`;
     }
 
     function clearAnySwipeLinkedHighlight() {
@@ -721,7 +770,7 @@
 
     function updateUserBubbleForActiveKey() {
         if (!activeKey) return;
-        const userText = map.get(activeKey);
+        const userText = getLinkedTextByKey(activeKey);
         if (userText == null) {
             clearUserBubbleHighlightForActiveKey();
             return;
@@ -760,7 +809,7 @@
         // Compare stored text against the canonical user message in chat data.
         // Only highlight if the text was actually modified for this swipe variant.
         const chat = SillyTavern.getContext().chat;
-        const originalUserText = chat && chat[userIndex] ? chat[userIndex].mes : null;
+        const originalUserText = chat && chat[userIndex] ? (chat[userIndex].extra?.display_text ?? chat[userIndex].mes) : null;
         if (originalUserText != null && userText.trim() === originalUserText.trim()) {
             // Text wasn't modified – restore formatted DOM and don't highlight
             restoreUserBubbleFromChat(userEl);
@@ -794,7 +843,10 @@
         }
         if (aiIdx == null) return;
         const aiMsg = chat[aiIdx];
-        if (!aiMsg) return;
+        if (!aiMsg || aiMsg.is_user || aiMsg.is_system || !hasAssistantContent(aiMsg)) {
+            activeKey = null;
+            return;
+        }
         const assistantMesId = getMesIdFromChatIndex(aiIdx);
 
         const swipeId = resolveSwipeId(assistantMesId, aiMsg);
@@ -809,7 +861,7 @@
             clearAnySwipeLinkedHighlight();
             return;
         }
-        if (!map.has(activeKey)) {
+        if (!hasLinkedTextByKey(activeKey)) {
             log('No mapping for key', activeKey);
             clearUserBubbleHighlightForActiveKey();
             return;
@@ -874,7 +926,6 @@
         pendingGenerationType = null;
         didReceiveMessageForGeneration = false;
         pendingSwipeGenerationKey = null;
-        map.clear();
         detachObserver();
         invalidateMesElCache();
         if (swipeDebounceTimer) {
@@ -929,6 +980,7 @@
         if (!shouldTrackGenerationType(type)) return;
 
         isGenerating = true;
+        generationSeq++;
         generationType = normalizeGenerationEventType(type);
         pendingGenerationType = generationType;
         didReceiveMessageForGeneration = false;
@@ -954,13 +1006,20 @@
         if (!shouldTrackGenerationType(type)) return;
 
         isGenerating = true;
+        generationSeq++;
         generationType = normalizeGenerationEventType(type) || generationType;
         pendingGenerationType = generationType;
         didReceiveMessageForGeneration = false;
         if (generationType === 'normal') {
             captureGenerationContext(generationType, { capturedAt: 'started', overwrite: true });
-        } else {
+        } else if (!generationContext || generationContext.type !== generationType
+            || (!generationContext.sourceKey && typeof generationContext.sourceUserText !== 'string')) {
             captureGenerationContext(generationType, { capturedAt: 'started', overwrite: true });
+        } else {
+            generationKey = generationContext.sourceKey;
+            if (typeof generationContext.sourceUserText === 'string') {
+                pendingUserText = generationContext.sourceUserText;
+            }
         }
         log('GENERATION_STARTED – pending:', pendingUserText && pendingUserText.substring(0, 60), 'key:', generationKey, 'ctx:', generationContext);
     }
@@ -1029,7 +1088,7 @@
             } else if (typeof pendingUserText === 'string') {
                 userTextForMapping = pendingUserText;
             } else if (keyUsedForGeneration) {
-                const mappedText = map.get(keyUsedForGeneration);
+                const mappedText = getLinkedTextByKey(keyUsedForGeneration);
                 if (typeof mappedText === 'string') {
                     userTextForMapping = mappedText;
                 }
@@ -1046,9 +1105,12 @@
         const storedKey = setMapping(assistantMesId, swipeId, userTextForMapping, {
             setActive: true,
             source: 'MESSAGE_RECEIVED',
+            skipSave: true,
+            confirm: true,
         });
         if (!storedKey) return;
         didReceiveMessageForGeneration = true;
+        pendingSwipeGenerationKey = null;
         if (effectiveType === 'normal') {
             pendingNormalUserText = null;
         } else {
@@ -1060,6 +1122,7 @@
         generationKey = null;
         generationContext = null;
         pendingGenerationType = null;
+        requestChatSave();
     }
 
     function onCharacterMessageRendered(messageIndex) {
@@ -1082,15 +1145,30 @@
 
     function onGenerationEnded() {
         const preserveForLateMessage = !didReceiveMessageForGeneration && shouldTrackGenerationType(pendingGenerationType);
+        const seqAtEnd = generationSeq;
+        const overswipeKeyToRestore = !didReceiveMessageForGeneration ? generationContext?._usedOverswipeKey : null;
 
         isGenerating = false;
-        pendingSwipeGenerationKey = null;
+        if (overswipeKeyToRestore && hasLinkedTextByKey(overswipeKeyToRestore)) {
+            pendingSwipeGenerationKey = overswipeKeyToRestore;
+        } else if (!preserveForLateMessage) {
+            pendingSwipeGenerationKey = null;
+        }
 
         if (!didReceiveMessageForGeneration && !preserveForLateMessage && pendingUserText) {
             log('GENERATION_ENDED – no MESSAGE_RECEIVED for tracked generation; skipped fallback mapping write');
         }
         if (preserveForLateMessage) {
             log('GENERATION_ENDED – preserving context for late MESSAGE_RECEIVED', pendingGenerationType, generationKey);
+            setTimeout(() => {
+                if (generationSeq !== seqAtEnd || isGenerating || didReceiveMessageForGeneration) return;
+                pendingUserText = null;
+                generationKey = null;
+                generationContext = null;
+                pendingGenerationType = null;
+                pendingSwipeGenerationKey = null;
+                log('GENERATION_ENDED – cleared stale preserved context', seqAtEnd);
+            }, 5000);
         } else {
             pendingUserText = null;
             generationKey = null;
@@ -1121,7 +1199,7 @@
             typeof aiMsg.swipe_id === 'number' &&
             aiMsg.swipe_id >= aiMsg.swipes.length,
         );
-        if (isOverswipePending && previousKey && map.has(previousKey)) {
+        if (isOverswipePending && previousKey && hasLinkedTextByKey(previousKey)) {
             pendingSwipeGenerationKey = previousKey;
             log('MESSAGE_SWIPED – captured pre-overswipe key', pendingSwipeGenerationKey);
         } else if (!isGenerating) {
@@ -1135,7 +1213,7 @@
                 refreshActiveKeyFromChat();
             }
             log('Active key after swipe', activeKey);
-            if (!activeKey || !map.has(activeKey)) {
+            if (!activeKey || !hasLinkedTextByKey(activeKey)) {
                 clearUserBubbleHighlightForActiveKey();
                 return;
             }
@@ -1148,7 +1226,7 @@
         if (isGenerating) return;
         requestAnimationFrame(() => {
             refreshActiveKeyFromChat();
-            if (!activeKey || !map.has(activeKey)) {
+            if (!activeKey || !hasLinkedTextByKey(activeKey)) {
                 clearUserBubbleHighlightForActiveKey();
                 return;
             }
@@ -1162,18 +1240,7 @@
         if (!chat || messageIndex == null) return;
 
         const editedIndex = findChatIndexByMesId(messageIndex);
-        const lastUserIndex = getLastUserIndexFromChat();
-        if (editedIndex == null || lastUserIndex == null) return;
-        if (editedIndex !== lastUserIndex || !chat[editedIndex]?.is_user) {
-            return; // Track only latest user/assistant turn pair.
-        }
-
-        refreshActiveKeyFromChat();
-        const keyAtEdit = activeKey;
-        if (!keyAtEdit) {
-            log('MESSAGE_EDITED – no active key, skipped keyed edit capture');
-            return;
-        }
+        if (editedIndex == null || !chat[editedIndex]?.is_user) return;
 
         let editedText = typeof chat[editedIndex]?.mes === 'string' ? chat[editedIndex].mes : null;
         if (typeof editedText !== 'string') {
@@ -1181,8 +1248,42 @@
         }
         if (typeof editedText !== 'string') return;
 
+        const assistantIndexes = [];
+        for (let i = editedIndex + 1; i < chat.length; i++) {
+            const msg = chat[i];
+            if (!msg) continue;
+            if (msg.is_user) break;
+            if (!msg.is_system && hasAssistantContent(msg)) assistantIndexes.push(i);
+        }
+
+        if (!assistantIndexes.length) {
+            activeKey = null;
+            pendingEditedEntry = null;
+            pendingNormalUserText = editedText;
+            clearAnySwipeLinkedHighlight();
+            log('MESSAGE_EDITED – user has no assistant in turn; updated pending normal text:', editedText.substring(0, 60));
+            return;
+        }
+
+        let pairedAssistantIndex = assistantIndexes[assistantIndexes.length - 1];
+        const parsedActive = parseMappingKey(activeKey);
+        if (parsedActive) {
+            const activeIdx = findChatIndexByMesId(parsedActive.assistantMesId);
+            if (assistantIndexes.includes(activeIdx)) pairedAssistantIndex = activeIdx;
+        }
+
+        const assistantMesId = getMesIdFromChatIndex(pairedAssistantIndex);
+        const swipeId = resolveSwipeId(assistantMesId, chat[pairedAssistantIndex]);
+        const keyAtEdit = `${assistantMesId}:${swipeId}`;
+
+        const lastUserIndex = getLastUserIndexFromChat();
+        const isLatestUser = editedIndex === lastUserIndex;
+        if (isLatestUser) {
+            activeKey = keyAtEdit;
+        }
+
         pendingEditedEntry = { key: keyAtEdit, text: editedText };
-        log('MESSAGE_EDITED – pending keyed edit updated:', keyAtEdit, editedText.substring(0, 60));
+        log('MESSAGE_EDITED – pending keyed edit updated:', keyAtEdit, editedText.substring(0, 60), isLatestUser ? '(latest)' : '(non-latest)');
     }
 
     function onMessageDeleted(_chatLength) {
@@ -1199,8 +1300,6 @@
             });
             return;
         }
-
-        const pruned = pruneMappingsForDeletedAssistants();
 
         if (activeKey && !doesAssistantExistForKey(activeKey)) {
             activeKey = null;
@@ -1225,7 +1324,7 @@
         pendingNormalUserText = null;
         pendingUserText = null;
         pendingGenerationType = null;
-        log('MESSAGE_DELETED – pruned stale mappings and rebuilding current state', pruned);
+        log('MESSAGE_DELETED – rebuilding current state');
 
         requestAnimationFrame(() => {
             captureCurrentState();
@@ -1242,51 +1341,40 @@
         const { messageId, swipeId } = data;
         if (typeof messageId !== 'number' || typeof swipeId !== 'number') return;
 
-        const assistantMesId = getMesIdFromChatIndex(messageId);
-        if (assistantMesId == null) return;
+        const chat = SillyTavern.getContext().chat;
+        let assistantIdx = findChatIndexByMesId(messageId);
+        if (assistantIdx == null && chat && messageId >= 0 && messageId < chat.length) {
+            const msg = chat[messageId];
+            if (msg && !msg.is_user && !msg.is_system) assistantIdx = messageId;
+        }
+        const assistantMesId = assistantIdx != null ? getMesIdFromChatIndex(assistantIdx) : messageId;
 
-        // 1. Delete the mapping for the removed swipe
-        const deletedKey = `${assistantMesId}:${swipeId}`;
-        map.delete(deletedKey);
+        activeKey = adjustKeyAfterSwipeDelete(activeKey, assistantMesId, swipeId);
+        generationKey = adjustKeyAfterSwipeDelete(generationKey, assistantMesId, swipeId);
+        pendingSwipeGenerationKey = adjustKeyAfterSwipeDelete(pendingSwipeGenerationKey, assistantMesId, swipeId);
 
         if (pendingEditedEntry && typeof pendingEditedEntry.key === 'string') {
-            const parsed = parseMappingKey(pendingEditedEntry.key);
-            if (parsed && parsed.assistantMesId === assistantMesId) {
-                if (parsed.swipeId === swipeId) {
-                    pendingEditedEntry = null;
-                } else if (parsed.swipeId > swipeId) {
-                    pendingEditedEntry = {
-                        key: `${assistantMesId}:${parsed.swipeId - 1}`,
-                        text: pendingEditedEntry.text,
-                    };
-                }
+            const adjustedKey = adjustKeyAfterSwipeDelete(pendingEditedEntry.key, assistantMesId, swipeId);
+            if (adjustedKey) {
+                pendingEditedEntry = { ...pendingEditedEntry, key: adjustedKey };
+            } else {
+                pendingEditedEntry = null;
             }
         }
 
-        // 2. Shift all mappings above the deleted index down by 1
-        const toRename = [];
-        for (const key of map.keys()) {
-            const m = /^(\d+):(\d+)$/.exec(key);
-            if (!m) continue;
-            if (Number(m[1]) === assistantMesId && Number(m[2]) > swipeId) {
-                toRename.push({ oldKey: key, oldIdx: Number(m[2]) });
-            }
-        }
-        // Sort descending so we don't collide during rename
-        toRename.sort((a, b) => b.oldIdx - a.oldIdx);
-        for (const { oldKey, oldIdx } of toRename) {
-            const value = map.get(oldKey);
-            map.delete(oldKey);
-            if (typeof value === 'string') {
-                setMapping(assistantMesId, oldIdx - 1, value, { source: 'MESSAGE_SWIPE_DELETED' });
-            }
+        if (generationContext?.sourceKey) {
+            const adjustedKey = adjustKeyAfterSwipeDelete(generationContext.sourceKey, assistantMesId, swipeId);
+            generationContext = {
+                ...generationContext,
+                sourceKey: adjustedKey,
+                sourceAssistantMesId: adjustedKey ? generationContext.sourceAssistantMesId : null,
+            };
         }
 
-        log('MESSAGE_SWIPE_DELETED – shifted', toRename.length, 'mappings, deleted key', deletedKey);
+        log('MESSAGE_SWIPE_DELETED – adjusted session keys for assistant', assistantMesId, 'deleted swipe', swipeId);
 
-        // 3. Refresh active key (MESSAGE_SWIPED will also fire, but be safe)
-        refreshActiveKeyFromChat();
-        if (!activeKey || !map.has(activeKey)) {
+        refreshActiveKeyFromChat(assistantMesId);
+        if (!activeKey || !hasLinkedTextByKey(activeKey)) {
             clearUserBubbleHighlightForAssistant(assistantMesId);
             return;
         }
@@ -1311,6 +1399,8 @@
         }
         pendingNormalUserText = typeof sentUserText === 'string' ? sentUserText : null;
         pendingEditedEntry = null;
+        activeKey = null;
+        clearAnySwipeLinkedHighlight();
         log('MESSAGE_SENT – pending normal text:', pendingNormalUserText && pendingNormalUserText.substring(0, 60));
 
         // Preserve mappings so follow-up assistant generations can patch historical context.
@@ -1346,22 +1436,6 @@
             return;
         }
 
-        // Validate key belongs to the current assistant message for types that
-        // keep the assistant row in place (swipe/continue). Regenerate can
-        // delete the source assistant before interceptors run.
-        const keyAssistantMesId = parsedKey.assistantMesId;
-        const lastAiIdx = getLastAssistantIndexFromChat();
-        const lastAiMesId = lastAiIdx != null ? getMesIdFromChatIndex(lastAiIdx) : null;
-        const requireAssistantMatch = interceptorType === 'swipe' || interceptorType === 'continue';
-        if (requireAssistantMatch) {
-            if (lastAiMesId != null && keyAssistantMesId !== lastAiMesId) {
-                log('Interceptor: key assistant', keyAssistantMesId, 'does not match last assistant', lastAiMesId, '— skipping patch');
-                return;
-            }
-        } else if (interceptorType === 'regenerate' && lastAiMesId != null && keyAssistantMesId !== lastAiMesId) {
-            log('Interceptor: allowing regenerate key assistant mismatch', keyAssistantMesId, lastAiMesId);
-        }
-
         let textSource = null;
         let textToPatch = null;
         if (pendingEditedEntry && pendingEditedEntry.key === keyToUse && typeof pendingEditedEntry.text === 'string') {
@@ -1376,7 +1450,7 @@
             textSource = 'pending';
             textToPatch = pendingUserText;
         } else {
-            const mappedText = map.get(keyToUse);
+            const mappedText = getLinkedTextByKey(keyToUse);
             if (typeof mappedText === 'string') {
                 textSource = 'mapped';
                 textToPatch = mappedText;
@@ -1387,12 +1461,64 @@
             return;
         }
 
-        // For swipe-like prompt shapes, always patch the latest user row in interceptor chat.
         let userIdx = -1;
+        const sourceAssistantMesId = generationContext?.sourceAssistantMesId ?? parsedKey.assistantMesId;
+        const liveCtx = globalThis.SillyTavern?.getContext?.();
+        const liveChat = liveCtx?.chat;
+        let coreAssistantIdx = -1;
+
         for (let i = chat.length - 1; i >= 0; i--) {
-            if (chat[i]?.is_user) {
-                userIdx = i;
+            const msg = chat[i];
+            if (!msg || msg.is_user || msg.is_system) continue;
+            const mid = msg.mesid ?? msg.mesId ?? msg.message_id;
+            if (mid === sourceAssistantMesId || (typeof mid === 'string' && mid === String(sourceAssistantMesId))) {
+                coreAssistantIdx = i;
                 break;
+            }
+        }
+
+        if (coreAssistantIdx === -1 && liveChat && sourceAssistantMesId != null) {
+            const liveAssistantIdx = findChatIndexByMesId(sourceAssistantMesId);
+            const liveAssistant = liveAssistantIdx != null ? liveChat[liveAssistantIdx] : null;
+            if (liveAssistant?.send_date) {
+                for (let i = chat.length - 1; i >= 0; i--) {
+                    if (chat[i]?.send_date === liveAssistant.send_date && !chat[i]?.is_user && !chat[i]?.is_system) {
+                        coreAssistantIdx = i;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (coreAssistantIdx !== -1) {
+            for (let i = coreAssistantIdx - 1; i >= 0; i--) {
+                if (chat[i]?.is_user) {
+                    userIdx = i;
+                    break;
+                }
+            }
+        }
+
+        if (userIdx === -1 && liveChat && sourceAssistantMesId != null) {
+            const liveAssistantIdx = findChatIndexByMesId(sourceAssistantMesId);
+            const liveUserIdx = liveAssistantIdx != null ? getUserIndexBefore(liveAssistantIdx) : null;
+            const liveUser = liveUserIdx != null ? liveChat[liveUserIdx] : null;
+            if (liveUser?.send_date) {
+                for (let i = chat.length - 1; i >= 0; i--) {
+                    if (chat[i]?.is_user && chat[i].send_date === liveUser.send_date) {
+                        userIdx = i;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (userIdx === -1) {
+            for (let i = chat.length - 1; i >= 0; i--) {
+                if (chat[i]?.is_user) {
+                    userIdx = i;
+                    break;
+                }
             }
         }
         if (userIdx === -1) {
