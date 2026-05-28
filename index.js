@@ -935,12 +935,23 @@
 
     function scheduleSwipeRenderAfterFrame(assistantIndexOrMesId = null) {
         const seq = ++swipeRenderSeq;
+        const renderIfCurrent = (phase) => {
+            if (seq !== swipeRenderSeq) return;
+            log('Rendering linked user bubble after swipe', phase);
+            handleSwipeChangeForAssistant(assistantIndexOrMesId);
+        };
+
         requestAnimationFrame(() => {
             setTimeout(() => {
-                if (seq !== swipeRenderSeq) return;
-                handleSwipeChangeForAssistant(assistantIndexOrMesId);
+                renderIfCurrent('frame');
             }, 0);
         });
+
+        // SillyTavern may re-render the edited user row after MESSAGE_SWIPED.
+        // Re-apply once after that work settles so the marker and text stay in sync.
+        setTimeout(() => {
+            renderIfCurrent('settled');
+        }, 250);
     }
 
     // ─── MutationObserver ────────────────────────────────────────────────────────
@@ -1195,6 +1206,7 @@
         generationContext = null;
         pendingGenerationType = null;
         requestChatSave();
+        scheduleSwipeRenderAfterFrame(assistantMesId);
     }
 
     function onCharacterMessageRendered(messageIndex) {
