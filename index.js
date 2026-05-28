@@ -20,6 +20,7 @@
     let pendingEditedEntry = null; // { key, text } bound to the swipe key where latest-user edit occurred
     let generationContext = null; // { type, sourceKey, sourceAssistantMesId, sourceUserText, capturedAt }
     let generationSeq = 0; // Guards delayed cleanup from previous generation lifecycles
+    let swipeRenderSeq = 0; // Guards delayed swipe DOM updates from older events
     const mesElCache = new Map(); // mesId -> Element cache for getMesElByIndex
     let lastMesElCache = { user: null, assistant: null }; // cached results for getLastMesEl
     const eventSubscriptions = [];
@@ -75,10 +76,7 @@
         const chat = ctx?.chat;
         if (!chat || mesIdOrIdx == null) return null;
 
-        let chatIndex = findChatIndexByMesId(mesIdOrIdx);
-        if (chatIndex == null && typeof mesIdOrIdx === 'number' && mesIdOrIdx >= 0 && mesIdOrIdx < chat.length) {
-            chatIndex = mesIdOrIdx;
-        }
+        const chatIndex = findChatIndexByMesId(mesIdOrIdx);
         const msg = chatIndex != null ? chat[chatIndex] : null;
         return msg && !msg.is_user && !msg.is_system ? msg : null;
     }
@@ -89,8 +87,11 @@
             const activeText = assistantMsg.extra?.linked_user_text;
             return typeof activeText === 'string' ? activeText : null;
         }
-        const linkedText = assistantMsg.swipe_info?.[swipeId]?.extra?.linked_user_text;
+        const swipeInfo = assistantMsg.swipe_info?.[swipeId];
+        const linkedText = swipeInfo?.extra?.linked_user_text;
         if (typeof linkedText === 'string') return linkedText;
+        if (swipeInfo) return null;
+
         const activeSwipeId = typeof assistantMsg.swipe_id === 'number' ? assistantMsg.swipe_id : 0;
         if (swipeId === activeSwipeId && typeof assistantMsg.extra?.linked_user_text === 'string') {
             return assistantMsg.extra.linked_user_text;
@@ -226,7 +227,7 @@
         const mesId = Number(mesIdRaw);
         if (!Number.isFinite(mesId)) return;
 
-        const chatIndex = findChatIndexByMesId(mesId);
+        const chatIndex = findChatIndexByEventId(mesId);
         if (chatIndex == null) return;
         const msg = chat[chatIndex];
         if (!msg || !msg.is_user) return;
@@ -239,23 +240,25 @@
         textEl.innerHTML = formatUserMessageText(rawText, chatIndex);
     }
 
-    function ensureMappingForAssistantMesId(assistantMesId) {
+    function ensureMappingForAssistantMesId(assistantMesId, { setActive = true } = {}) {
         const ctx = SillyTavern.getContext();
         const chat = ctx.chat;
-        if (!chat) return;
+        if (!chat) return null;
 
         const aiIdx = findChatIndexByMesId(assistantMesId);
-        if (aiIdx == null) return;
+        if (aiIdx == null) return null;
         const aiMsg = chat[aiIdx];
-        if (!aiMsg || aiMsg.is_user || aiMsg.is_system) return;
+        if (!aiMsg || aiMsg.is_user || aiMsg.is_system) return null;
 
         const userIdx = getUserIndexBefore(aiIdx);
-        if (userIdx == null) return;
+        if (userIdx == null) return null;
 
         // Backfill must not create persisted metadata. Only ground-truth
         // generation completion writes linked_user_text.
         const swipeId = resolveSwipeId(assistantMesId, aiMsg);
-        activeKey = `${assistantMesId}:${swipeId}`;
+        const key = `${assistantMesId}:${swipeId}`;
+        if (setActive) activeKey = key;
+        return key;
     }
 
     globalThis.swipeLinkedUserEditDebug = function () {
@@ -332,7 +335,7 @@
 
     function getChatIndexForMesEl(el) {
         for (const id of getMesIdsFromElement(el)) {
-            const chatIndex = findChatIndexByMesId(id);
+            const chatIndex = findChatIndexByEventId(id);
             if (chatIndex != null) return chatIndex;
         }
         return null;
@@ -503,8 +506,27 @@
             if (mid === mesId) return i;
             if (typeof mid === 'string' && String(mesId) === mid) return i;
         }
-        // If it looks like an index and is in range, allow it.
-        if (typeof mesId === 'number' && mesId >= 0 && mesId < chat.length) return mesId;
+        // If SillyTavern has no stable message ids, allow array-index fallback.
+        // Do not let an old stable mesid accidentally resolve to a different
+        // message that happens to occupy the same numeric array slot.
+        if (typeof mesId === 'number' && mesId >= 0 && mesId < chat.length) {
+            const candidate = chat[mesId];
+            const candidateMid = candidate?.mesid ?? candidate?.mesId ?? candidate?.message_id;
+            if (candidateMid == null || candidateMid === '') return mesId;
+        }
+        return null;
+    }
+
+    function findChatIndexByEventId(messageId) {
+        const chat = SillyTavern.getContext().chat;
+        if (!chat || messageId == null) return null;
+
+        const chatIndex = findChatIndexByMesId(messageId);
+        if (chatIndex != null) return chatIndex;
+
+        if (typeof messageId === 'number' && messageId >= 0 && messageId < chat.length) {
+            return messageId;
+        }
         return null;
     }
 
@@ -722,6 +744,15 @@
         });
     }
 
+    function clearSwipeLinkedHighlightsExcept(exceptEl) {
+        const highlighted = document.querySelectorAll('#chat .mes[data-swipe-linked="1"]');
+        highlighted.forEach((el) => {
+            if (el === exceptEl) return;
+            restoreUserBubbleFromChat(el);
+            el.removeAttribute('data-swipe-linked');
+        });
+    }
+
     function clearUserBubbleHighlightForAssistant(assistantMesId) {
         if (assistantMesId == null) {
             clearAnySwipeLinkedHighlight();
@@ -800,6 +831,7 @@
             clearAnySwipeLinkedHighlight();
             return;
         }
+        clearSwipeLinkedHighlightsExcept(userEl);
         const textEl = getMesTextEl(userEl);
         if (!textEl) {
             clearAnySwipeLinkedHighlight();
@@ -835,9 +867,6 @@
         let aiIdx = null;
         if (assistantIndexOrMesId != null) {
             aiIdx = findChatIndexByMesId(assistantIndexOrMesId);
-            if (aiIdx == null && typeof assistantIndexOrMesId === 'number' && assistantIndexOrMesId >= 0 && assistantIndexOrMesId < chat.length) {
-                aiIdx = assistantIndexOrMesId;
-            }
         } else {
             aiIdx = getLastAssistantIndexFromChat();
         }
@@ -869,9 +898,37 @@
         updateUserBubbleForActiveKey();
     }
 
-    function scheduleSwipeCheck() {
+    function handleSwipeChangeForAssistant(assistantIndexOrMesId = null) {
+        refreshActiveKeyFromChat(assistantIndexOrMesId);
+        if (!activeKey) {
+            clearAnySwipeLinkedHighlight();
+            return;
+        }
+        if (!hasLinkedTextByKey(activeKey)) {
+            log('No mapping for key', activeKey);
+            clearAnySwipeLinkedHighlight();
+            return;
+        }
+        updateUserBubbleForActiveKey();
+    }
+
+    function scheduleSwipeCheck(assistantIndexOrMesId = null) {
         if (swipeDebounceTimer) clearTimeout(swipeDebounceTimer);
-        swipeDebounceTimer = setTimeout(handleSwipeChange, 200);
+        const seq = ++swipeRenderSeq;
+        swipeDebounceTimer = setTimeout(() => {
+            if (seq !== swipeRenderSeq) return;
+            handleSwipeChangeForAssistant(assistantIndexOrMesId);
+        }, 200);
+    }
+
+    function scheduleSwipeRenderAfterFrame(assistantIndexOrMesId = null) {
+        const seq = ++swipeRenderSeq;
+        requestAnimationFrame(() => {
+            setTimeout(() => {
+                if (seq !== swipeRenderSeq) return;
+                handleSwipeChangeForAssistant(assistantIndexOrMesId);
+            }, 0);
+        });
     }
 
     // ─── MutationObserver ────────────────────────────────────────────────────────
@@ -932,6 +989,7 @@
             clearTimeout(swipeDebounceTimer);
             swipeDebounceTimer = null;
         }
+        swipeRenderSeq++;
         log('State cleared');
     }
 
@@ -942,6 +1000,7 @@
         if (typeof arg === 'string' && arg.trim() !== '' && !Number.isNaN(Number(arg))) return Number(arg);
         if (!arg || typeof arg !== 'object') return null;
         if (typeof arg.messageIndex === 'number') return arg.messageIndex;
+        if (typeof arg.messageId === 'number') return arg.messageId;
         if (typeof arg.message_id === 'number') return arg.message_id;
         if (typeof arg.index === 'number') return arg.index;
         if (typeof arg.message_index === 'number') return arg.message_index;
@@ -950,6 +1009,7 @@
         if (typeof arg.id === 'number') return arg.id;
         if (typeof arg.mesid === 'string' && arg.mesid.trim() !== '' && !Number.isNaN(Number(arg.mesid))) return Number(arg.mesid);
         if (typeof arg.mesId === 'string' && arg.mesId.trim() !== '' && !Number.isNaN(Number(arg.mesId))) return Number(arg.mesId);
+        if (typeof arg.messageId === 'string' && arg.messageId.trim() !== '' && !Number.isNaN(Number(arg.messageId))) return Number(arg.messageId);
         if (typeof arg.id === 'string' && arg.id.trim() !== '' && !Number.isNaN(Number(arg.id))) return Number(arg.id);
         return null;
     }
@@ -1048,7 +1108,7 @@
         }
         if (!effectiveType) return;
 
-        const chatIndex = findChatIndexByMesId(messageIndex);
+        const chatIndex = findChatIndexByEventId(messageIndex);
         if (chatIndex == null) return;
 
         const msg = chat[chatIndex];
@@ -1132,13 +1192,19 @@
         requestAnimationFrame(() => {
             attachObserver();
             // Ensure the currently visible swipe (usually 0) has a mapping.
-            const chatIndex = messageIndex != null ? findChatIndexByMesId(messageIndex) : null;
+            const chatIndex = messageIndex != null ? findChatIndexByEventId(messageIndex) : null;
             if (chatIndex != null) {
-                const assistantMesId = getMesIdFromChatIndex(chatIndex);
-                ensureMappingForAssistantMesId(assistantMesId);
+                const isLatestAssistant = chatIndex === getLastAssistantIndexFromChat();
+                if (isLatestAssistant) {
+                    const assistantMesId = getMesIdFromChatIndex(chatIndex);
+                    const activeAssistantMesId = parseMappingKey(activeKey)?.assistantMesId ?? null;
+                    ensureMappingForAssistantMesId(assistantMesId, {
+                        setActive: activeAssistantMesId == null || activeAssistantMesId === assistantMesId,
+                    });
+                }
             } else {
                 const aiIdx = getLastAssistantIndexFromChat();
-                if (aiIdx != null) ensureMappingForAssistantMesId(getMesIdFromChatIndex(aiIdx));
+                if (aiIdx != null && !activeKey) ensureMappingForAssistantMesId(getMesIdFromChatIndex(aiIdx));
             }
         });
     }
@@ -1188,10 +1254,7 @@
         // fires immediately after this emit resolves.
         const ctx = SillyTavern.getContext();
         const chat = ctx.chat;
-        let aiIdx = messageIndex != null ? findChatIndexByMesId(messageIndex) : getLastAssistantIndexFromChat();
-        if (aiIdx == null && typeof messageIndex === 'number' && messageIndex >= 0 && chat && messageIndex < chat.length) {
-            aiIdx = messageIndex;
-        }
+        const aiIdx = messageIndex != null ? findChatIndexByEventId(messageIndex) : getLastAssistantIndexFromChat();
         const aiMsg = aiIdx != null && chat ? chat[aiIdx] : null;
         const isOverswipePending = Boolean(
             aiMsg &&
@@ -1206,32 +1269,17 @@
             pendingSwipeGenerationKey = null;
         }
 
-        requestAnimationFrame(() => {
-            if (messageIndex != null) {
-                refreshActiveKeyFromChat(messageIndex);
-            } else {
-                refreshActiveKeyFromChat();
-            }
-            log('Active key after swipe', activeKey);
-            if (!activeKey || !hasLinkedTextByKey(activeKey)) {
-                clearUserBubbleHighlightForActiveKey();
-                return;
-            }
-            updateUserBubbleForActiveKey();
-        });
+        scheduleSwipeRenderAfterFrame(aiIdx != null ? getMesIdFromChatIndex(aiIdx) : null);
     }
 
     function onMessageUpdated(messageIndex) {
         messageIndex = normalizeMessageIndex(messageIndex);
         if (isGenerating) return;
-        requestAnimationFrame(() => {
-            refreshActiveKeyFromChat();
-            if (!activeKey || !hasLinkedTextByKey(activeKey)) {
-                clearUserBubbleHighlightForActiveKey();
-                return;
-            }
-            updateUserBubbleForActiveKey();
-        });
+        const chat = SillyTavern.getContext().chat;
+        const chatIndex = messageIndex != null ? findChatIndexByEventId(messageIndex) : null;
+        const msg = chatIndex != null && chat ? chat[chatIndex] : null;
+        const assistantMesId = msg && !msg.is_user && !msg.is_system ? getMesIdFromChatIndex(chatIndex) : null;
+        scheduleSwipeRenderAfterFrame(assistantMesId);
     }
 
     function onMessageEdited(messageIndex) {
@@ -1239,7 +1287,7 @@
         const chat = SillyTavern.getContext().chat;
         if (!chat || messageIndex == null) return;
 
-        const editedIndex = findChatIndexByMesId(messageIndex);
+        const editedIndex = findChatIndexByEventId(messageIndex);
         if (editedIndex == null || !chat[editedIndex]?.is_user) return;
 
         let editedText = typeof chat[editedIndex]?.mes === 'string' ? chat[editedIndex].mes : null;
@@ -1341,12 +1389,7 @@
         const { messageId, swipeId } = data;
         if (typeof messageId !== 'number' || typeof swipeId !== 'number') return;
 
-        const chat = SillyTavern.getContext().chat;
-        let assistantIdx = findChatIndexByMesId(messageId);
-        if (assistantIdx == null && chat && messageId >= 0 && messageId < chat.length) {
-            const msg = chat[messageId];
-            if (msg && !msg.is_user && !msg.is_system) assistantIdx = messageId;
-        }
+        let assistantIdx = findChatIndexByEventId(messageId);
         const assistantMesId = assistantIdx != null ? getMesIdFromChatIndex(assistantIdx) : messageId;
 
         activeKey = adjustKeyAfterSwipeDelete(activeKey, assistantMesId, swipeId);
@@ -1386,7 +1429,7 @@
         const chat = SillyTavern.getContext().chat;
         let sentUserText = null;
         if (chat && messageIndex != null) {
-            const chatIndex = findChatIndexByMesId(messageIndex);
+            const chatIndex = findChatIndexByEventId(messageIndex);
             if (chatIndex != null) {
                 const msg = chat[chatIndex];
                 if (msg?.is_user && typeof msg.mes === 'string') {
@@ -1554,8 +1597,11 @@
         if (!(target instanceof Element)) return;
         const btn = target.closest('.swipe_left, .swipe_right');
         if (!btn) return;
+        const mesEl = btn.closest('.mes');
+        const chatIndex = mesEl ? getChatIndexForMesEl(mesEl) : null;
+        const assistantIndexOrMesId = chatIndex != null ? getMesIdFromChatIndex(chatIndex) : null;
         // Allow ST to process the swipe first, then check
-        requestAnimationFrame(() => scheduleSwipeCheck());
+        requestAnimationFrame(() => scheduleSwipeCheck(assistantIndexOrMesId));
     }
 
     // ─── Init / Teardown ─────────────────────────────────────────────────────────
