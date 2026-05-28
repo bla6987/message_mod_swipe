@@ -216,6 +216,18 @@
         return div.innerHTML;
     }
 
+    function getUserDisplayText(msg) {
+        if (!msg || !msg.is_user) return null;
+        if (typeof msg.extra?.display_text === 'string') return msg.extra.display_text;
+        if (typeof msg.mes === 'string') return msg.mes;
+        return null;
+    }
+
+    function getUserMessageText(msg) {
+        if (!msg || !msg.is_user || typeof msg.mes !== 'string') return null;
+        return msg.mes;
+    }
+
     function restoreUserBubbleFromChat(mesEl) {
         if (!mesEl) return;
         const ctx = SillyTavern.getContext();
@@ -234,7 +246,7 @@
 
         const textEl = getMesTextEl(mesEl);
         if (!textEl) return;
-        const rawText = msg.extra?.display_text ?? msg.mes;
+        const rawText = getUserDisplayText(msg);
         if (typeof rawText !== 'string') return;
 
         textEl.innerHTML = formatUserMessageText(rawText, chatIndex);
@@ -562,7 +574,7 @@
         const chat = SillyTavern.getContext().chat;
         if (!chat) return null;
         for (let i = chat.length - 1; i >= 0; i--) {
-            if (chat[i]?.is_user) return chat[i].mes;
+            if (chat[i]?.is_user) return getUserMessageText(chat[i]);
         }
         return null;
     }
@@ -583,7 +595,7 @@
         if (assistantIdx == null) return null;
         const userIdx = getUserIndexBefore(assistantIdx);
         if (userIdx == null) return null;
-        return typeof chat[userIdx]?.mes === 'string' ? chat[userIdx].mes : null;
+        return getUserMessageText(chat[userIdx]);
     }
 
     function getUserMesForKey(key) {
@@ -841,7 +853,7 @@
         // Compare stored text against the canonical user message in chat data.
         // Only highlight if the text was actually modified for this swipe variant.
         const chat = SillyTavern.getContext().chat;
-        const originalUserText = chat && chat[userIndex] ? (chat[userIndex].extra?.display_text ?? chat[userIndex].mes) : null;
+        const originalUserText = chat && chat[userIndex] ? getUserDisplayText(chat[userIndex]) : null;
         if (originalUserText != null && userText.trim() === originalUserText.trim()) {
             // Text wasn't modified – restore formatted DOM and don't highlight
             restoreUserBubbleFromChat(userEl);
@@ -1132,8 +1144,8 @@
             } else {
                 // Fallback: use the user immediately before the received assistant.
                 const userIdx = getUserIndexBefore(chatIndex);
-                if (userIdx != null && typeof chat[userIdx]?.mes === 'string') {
-                    userTextForMapping = chat[userIdx].mes;
+                if (userIdx != null) {
+                    userTextForMapping = getUserMessageText(chat[userIdx]);
                 }
             }
         } else {
@@ -1290,7 +1302,7 @@
         const editedIndex = findChatIndexByEventId(messageIndex);
         if (editedIndex == null || !chat[editedIndex]?.is_user) return;
 
-        let editedText = typeof chat[editedIndex]?.mes === 'string' ? chat[editedIndex].mes : null;
+        let editedText = getUserMessageText(chat[editedIndex]);
         if (typeof editedText !== 'string') {
             editedText = getUserMesFromDomByMesId(getMesIdFromChatIndex(editedIndex));
         }
@@ -1432,8 +1444,8 @@
             const chatIndex = findChatIndexByEventId(messageIndex);
             if (chatIndex != null) {
                 const msg = chat[chatIndex];
-                if (msg?.is_user && typeof msg.mes === 'string') {
-                    sentUserText = msg.mes;
+                if (msg?.is_user) {
+                    sentUserText = getUserMessageText(msg);
                 }
             }
         }
