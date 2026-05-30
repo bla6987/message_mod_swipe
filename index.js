@@ -933,10 +933,18 @@
         }, 200);
     }
 
-    function scheduleSwipeRenderAfterFrame(assistantIndexOrMesId = null) {
+    function scheduleSwipeRenderAfterFrame(assistantIndexOrMesId = null, { skipWhileGenerating = false } = {}) {
         const seq = ++swipeRenderSeq;
         const renderIfCurrent = (phase) => {
             if (seq !== swipeRenderSeq) return;
+            // Load-path renders (CHAT_CHANGED/init) must not fight an in-flight
+            // generation. Re-check here, not just at schedule time, so a generation
+            // that starts within the settled window is also skipped. The swipe/
+            // receive paths leave this off because they intentionally render mid-gen.
+            if (skipWhileGenerating && isGenerating) {
+                log('Skipping linked user bubble render (generating)', phase);
+                return;
+            }
             log('Rendering linked user bubble after swipe', phase);
             handleSwipeChangeForAssistant(assistantIndexOrMesId);
         };
@@ -1055,6 +1063,10 @@
         requestAnimationFrame(() => {
             captureCurrentState();
             attachObserver();
+            // Reload/chat-switch may land on a non-latest swipe. Nothing fires
+            // MESSAGE_SWIPED in that case, so re-render the linked user bubble
+            // for the currently-selected swipe (no-op when no mapping exists).
+            scheduleSwipeRenderAfterFrame(null, { skipWhileGenerating: true });
         });
     }
 
@@ -1709,6 +1721,9 @@
             lastChatId = ctx.chatId || null;
             captureCurrentState();
             attachObserver();
+            // On first load the chat may already be sitting on a non-latest swipe.
+            // Render its linked user bubble (no-op when no mapping exists).
+            scheduleSwipeRenderAfterFrame(null, { skipWhileGenerating: true });
         });
 
         log('Extension initialized');

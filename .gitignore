@@ -20,3 +20,4 @@ GEMINI.md
 .amazonq/
 .plandex/
 # <<< agent_rules.sh managed <<<
+.DS_Store
