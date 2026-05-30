@@ -1067,6 +1067,7 @@
             // MESSAGE_SWIPED in that case, so re-render the linked user bubble
             // for the currently-selected swipe (no-op when no mapping exists).
             scheduleSwipeRenderAfterFrame(null, { skipWhileGenerating: true });
+            ensureEditsButtonsForLoadedChat();
         });
     }
 
@@ -1227,6 +1228,9 @@
         // Reattach observer to the newest assistant message
         requestAnimationFrame(() => {
             attachObserver();
+            const renderedIdx = messageIndex != null ? findChatIndexByEventId(messageIndex) : getLastAssistantIndexFromChat();
+            const renderedEl = renderedIdx != null ? getMesElForChatIndex(renderedIdx) : null;
+            if (renderedEl) ensureEditsButton(renderedEl);
             // Ensure the currently visible swipe (usually 0) has a mapping.
             const chatIndex = messageIndex != null ? findChatIndexByEventId(messageIndex) : null;
             if (chatIndex != null) {
@@ -1306,6 +1310,9 @@
         }
 
         scheduleSwipeRenderAfterFrame(aiIdx != null ? getMesIdFromChatIndex(aiIdx) : null);
+        // A fresh variant may have just crossed the "more than one swipe" threshold,
+        // so (re)evaluate the edits button for this message.
+        ensureEditsButtonForAssistant(aiIdx != null ? getMesIdFromChatIndex(aiIdx) : null);
     }
 
     function onMessageUpdated(messageIndex) {
@@ -1661,14 +1668,165 @@
         log('Interceptor patched user msg idx', userIdx, 'with key', keyToUse, 'source', textSource, 'to:', textToPatch.substring(0, 60));
     };
 
+    // ─── "View linked edits" Button ──────────────────────────────────────────────
+
+    const EDITS_BUTTON_CLASS = 'swipe_edits_view_button';
+
+    /**
+     * Add (or remove) the per-message "view linked edits" button on an AI message.
+     * The button is only shown when there is something to show — i.e. the message
+     * has more than one swipe or at least one recorded linked_user_text. Idempotent.
+     */
+    function ensureEditsButton(mesEl) {
+        if (!mesEl || mesEl.getAttribute('is_user') === 'true' || mesEl.getAttribute('is_system') === 'true') return;
+        const extraBtns = mesEl.querySelector('.extraMesButtons');
+        if (!extraBtns) return;
+        const chatIndex = getChatIndexForMesEl(mesEl);
+        const msg = chatIndex != null ? SillyTavern.getContext().chat?.[chatIndex] : null;
+        const existing = extraBtns.querySelector(`.${EDITS_BUTTON_CLASS}`);
+        if (!msg || msg.is_user || msg.is_system) {
+            if (existing) existing.remove();
+            return;
+        }
+        const hasMultipleSwipes = Array.isArray(msg.swipes) && msg.swipes.length > 1;
+        const hasAnyLinked = Array.isArray(msg.swipe_info)
+            && msg.swipe_info.some((si) => typeof si?.extra?.linked_user_text === 'string');
+        if (!hasMultipleSwipes && !hasAnyLinked) {
+            if (existing) existing.remove();
+            return;
+        }
+        if (existing) return;
+        const btn = document.createElement('div');
+        btn.className = `mes_button ${EDITS_BUTTON_CLASS} fa-solid fa-clock-rotate-left`;
+        btn.title = 'View linked user edits';
+        btn.setAttribute('data-i18n', '[title]View linked user edits');
+        extraBtns.appendChild(btn);
+    }
+
+    function ensureEditsButtonsForLoadedChat() {
+        const chatEl = document.getElementById('chat');
+        if (!chatEl) return;
+        chatEl.querySelectorAll('.mes').forEach((el) => ensureEditsButton(el));
+    }
+
+    function ensureEditsButtonForAssistant(assistantIndexOrMesId) {
+        if (assistantIndexOrMesId == null) return;
+        const chatIndex = findChatIndexByMesId(assistantIndexOrMesId);
+        const mesEl = chatIndex != null ? getMesElForChatIndex(chatIndex) : null;
+        if (mesEl) ensureEditsButton(mesEl);
+    }
+
+    function showEditsPopup(mesEl) {
+        const ctx = SillyTavern.getContext();
+        const chat = ctx.chat;
+        const chatIndex = getChatIndexForMesEl(mesEl);
+        const msg = chatIndex != null && chat ? chat[chatIndex] : null;
+        if (!msg || msg.is_user || msg.is_system) return;
+
+        const swipeCount = Array.isArray(msg.swipes) ? Math.max(1, msg.swipes.length) : 1;
+        const activeSwipe = getSwipeIdFromMsg(msg);
+
+        // Group swipes by their linked user text so identical edits collapse into one
+        // entry that lists the swipes it applies to. Preserve first-seen order.
+        const groups = [];
+        const groupByText = new Map();
+        const NONE = Symbol('none');
+        for (let i = 0; i < swipeCount; i++) {
+            const text = getLinkedUserText(msg, i);
+            const key = typeof text === 'string' ? text : NONE;
+            let group = groupByText.get(key);
+            if (!group) {
+                group = { text: typeof text === 'string' ? text : null, swipes: [] };
+                groupByText.set(key, group);
+                groups.push(group);
+            }
+            group.swipes.push(i);
+        }
+
+        const container = document.createElement('div');
+        container.className = 'swipe_edits_popup';
+        container.style.textAlign = 'left';
+        container.style.maxHeight = '60vh';
+        container.style.overflowY = 'auto';
+
+        const heading = document.createElement('h3');
+        heading.textContent = 'Linked user edits';
+        heading.style.marginTop = '0';
+        container.appendChild(heading);
+
+        const sub = document.createElement('div');
+        sub.style.opacity = '0.7';
+        sub.style.marginBottom = '12px';
+        sub.style.fontSize = '0.9em';
+        sub.textContent = `${groups.length} distinct edit${groups.length === 1 ? '' : 's'} across ${swipeCount} swipe${swipeCount === 1 ? '' : 's'}. The user text below is what each AI swipe was generated from.`;
+        container.appendChild(sub);
+
+        const userIndex = getUserIndexBefore(chatIndex);
+        const canonical = userIndex != null ? getUserDisplayText(chat[userIndex]) : null;
+
+        for (const group of groups) {
+            const block = document.createElement('div');
+            block.style.border = '1px solid var(--SmartThemeBorderColor, rgba(255,255,255,0.15))';
+            block.style.borderRadius = '8px';
+            block.style.padding = '8px 10px';
+            block.style.marginBottom = '10px';
+
+            const label = document.createElement('div');
+            label.style.fontSize = '0.85em';
+            label.style.opacity = '0.8';
+            label.style.marginBottom = '6px';
+            const swipeNums = group.swipes.map((s) => {
+                const oneBased = `#${s + 1}`;
+                return s === activeSwipe ? `${oneBased} (current)` : oneBased;
+            }).join(', ');
+            const tags = [];
+            if (group.swipes.includes(activeSwipe)) tags.push('current');
+            if (canonical != null && group.text != null && group.text.trim() === canonical.trim()) tags.push('matches latest message');
+            label.textContent = `Swipe ${swipeNums}${tags.length ? ' — ' + tags.join(', ') : ''}`;
+            block.appendChild(label);
+
+            const body = document.createElement('div');
+            body.style.whiteSpace = 'pre-wrap';
+            body.style.wordBreak = 'break-word';
+            if (group.text == null) {
+                body.style.fontStyle = 'italic';
+                body.style.opacity = '0.6';
+                body.textContent = 'No recorded edit (uses the latest message text).';
+            } else if (group.text.trim() === '') {
+                body.style.fontStyle = 'italic';
+                body.style.opacity = '0.6';
+                body.textContent = '(empty)';
+            } else {
+                body.textContent = group.text;
+            }
+            block.appendChild(body);
+            container.appendChild(block);
+        }
+
+        if (typeof ctx.callGenericPopup === 'function' && ctx.POPUP_TYPE) {
+            ctx.callGenericPopup(container, ctx.POPUP_TYPE.DISPLAY, '', { wide: true });
+        } else if (typeof ctx.callPopup === 'function') {
+            ctx.callPopup(container.outerHTML, 'text');
+        }
+    }
+
     // ─── Delegated Click Handler ─────────────────────────────────────────────────
 
     function onDocumentClick(e) {
+        const target = e.target;
+        if (!(target instanceof Element)) return;
+
+        // "View linked edits" button — handled regardless of swipe-detection mode.
+        const editsBtn = target.closest(`.${EDITS_BUTTON_CLASS}`);
+        if (editsBtn) {
+            const mesEl = editsBtn.closest('.mes');
+            if (mesEl) showEditsPopup(mesEl);
+            return;
+        }
+
         // If MESSAGE_SWIPED event is available, let it handle swipe detection
         if (hasMessageSwipedEvent) return;
 
-        const target = e.target;
-        if (!(target instanceof Element)) return;
         const btn = target.closest('.swipe_left, .swipe_right');
         if (!btn) return;
         const mesEl = btn.closest('.mes');
@@ -1700,9 +1858,14 @@
         }
     }
 
+    function removeAllEditsButtons() {
+        document.querySelectorAll(`.${EDITS_BUTTON_CLASS}`).forEach((el) => el.remove());
+    }
+
     function teardown() {
         unbindAllEvents();
         clearState();
+        removeAllEditsButtons();
         hasMessageSwipedEvent = false;
         document.removeEventListener('click', onDocumentClick);
         log('Extension torn down');
@@ -1762,6 +1925,7 @@
             // On first load the chat may already be sitting on a non-latest swipe.
             // Render its linked user bubble (no-op when no mapping exists).
             scheduleSwipeRenderAfterFrame(null, { skipWhileGenerating: true });
+            ensureEditsButtonsForLoadedChat();
         });
 
         log('Extension initialized');

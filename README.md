@@ -38,7 +38,14 @@ Then enable the extension in **Extensions > Manage Extensions** within SillyTave
 4. Swipe left/right between AI variants — the user bubble updates to show the text associated with each variant.
 5. When you send the next message, the prompt context includes the correct user text for the currently displayed AI variant.
 
-No buttons, no config UI. It works transparently with the existing swipe arrows and hotkeys.
+It works transparently with the existing swipe arrows and hotkeys — no config UI.
+
+### View linked edits
+
+AI messages that have more than one swipe (or any recorded edit) get a small
+history icon (⟲) in the message actions menu (the `…` button). Click it to open
+a popup listing the user text each swipe was generated from, grouping identical
+edits together and marking the swipe you're currently viewing.
 
 ## Debug Mode
 
