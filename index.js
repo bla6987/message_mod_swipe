@@ -1493,8 +1493,46 @@
 
     // ─── Generate Interceptor ────────────────────────────────────────────────────
 
+    /**
+     * Patch every historical user turn that sits before an assistant message parked
+     * on a NON-latest swipe, replacing its outgoing text with that swipe's linked
+     * user text. Used for `normal` sends, where the per-source-turn patch below does
+     * not run: without this, an earlier turn the user has swiped away from would be
+     * sent to the model as its latest-edited text rather than the branch's own text.
+     *
+     * Operates directly on the spread-copied coreChat entries (which carry
+     * swipe_info/swipe_id/swipes), so no live-chat matching is needed. Only
+     * non-latest swipes are touched — the latest swipe equals canonical by
+     * construction, and skipping it avoids clobbering regex-processed text.
+     */
+    function patchHistoricalUserTurns(chat) {
+        if (!Array.isArray(chat)) return;
+        for (let i = 0; i < chat.length; i++) {
+            const aiMsg = chat[i];
+            if (!aiMsg || aiMsg.is_user || aiMsg.is_system) continue;
+            const swipes = Array.isArray(aiMsg.swipes) ? aiMsg.swipes : null;
+            const swipeId = getSwipeIdFromMsg(aiMsg);
+            if (!swipes || swipeId >= swipes.length - 1) continue;
+            const linked = getLinkedUserText(aiMsg, swipeId);
+            if (typeof linked !== 'string') continue;
+            let userIdx = -1;
+            for (let j = i - 1; j >= 0; j--) {
+                if (chat[j]?.is_user) { userIdx = j; break; }
+            }
+            if (userIdx === -1) continue;
+            const userMsg = chat[userIdx];
+            if (!userMsg || typeof userMsg !== 'object' || userMsg.mes === linked) continue;
+            userMsg.mes = linked;
+            log('Interceptor (normal) patched historical user idx', userIdx, 'for assistant idx', i, 'swipe', swipeId, 'to:', linked.substring(0, 60));
+        }
+    }
+
     globalThis.swipeLinkedUserEditInterceptor = async function (chat, _contextSize, _abort, _type) {
         const interceptorType = normalizeGenerationEventType(_type);
+        if (interceptorType === 'normal') {
+            patchHistoricalUserTurns(chat);
+            return;
+        }
         if (interceptorType !== 'swipe' && interceptorType !== 'regenerate' && interceptorType !== 'continue') return;
 
         const skipPatch = (reason, details = {}) => {
