@@ -2,6 +2,18 @@
     'use strict';
 
     const EXTENSION_NAME = 'swipe_linked_user_edit';
+    const INSTANCE_KEY = '__swipeLinkedUserEditInstance';
+
+    if (typeof globalThis.swipeLinkedUserEditTeardown === 'function') {
+        try {
+            globalThis.swipeLinkedUserEditTeardown({ reason: 'reload' });
+        } catch (e) {
+            console.warn(`[${EXTENSION_NAME}] Failed to tear down previous instance`, e);
+        }
+    }
+
+    const instanceToken = {};
+    globalThis[INSTANCE_KEY] = instanceToken;
 
     // ─── State ────────────────────────────────────────────────────────────────────
     let activeKey = null;
@@ -21,11 +33,17 @@
     let generationContext = null; // { type, sourceKey, sourceAssistantMesId, sourceUserText, capturedAt }
     let generationSeq = 0; // Guards delayed cleanup from previous generation lifecycles
     let swipeRenderSeq = 0; // Guards delayed swipe DOM updates from older events
+    let editsButtonScanSeq = 0; // Guards chunked loaded-chat button scans
     const mesElCache = new Map(); // mesId -> Element cache for getMesElByIndex
     let lastMesElCache = { user: null, assistant: null }; // cached results for getLastMesEl
+    let chatLookupCache = null; // O(1) mesid -> chat index cache for the active chat
     const eventSubscriptions = [];
 
     // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+    function isCurrentInstance() {
+        return globalThis[INSTANCE_KEY] === instanceToken;
+    }
 
     function getSettings() {
         const ctx = globalThis.SillyTavern?.getContext?.();
@@ -169,6 +187,14 @@
         }
     }
 
+    function scheduleIdleTask(callback) {
+        if (typeof requestIdleCallback === 'function') {
+            requestIdleCallback(callback, { timeout: 500 });
+        } else {
+            setTimeout(() => callback({ timeRemaining: () => 0, didTimeout: true }), 0);
+        }
+    }
+
     function adjustKeyAfterSwipeDelete(key, assistantMesId, deletedSwipeId) {
         const parsed = parseMappingKey(key);
         if (!parsed || parsed.assistantMesId !== assistantMesId) return key;
@@ -305,10 +331,15 @@
 
     // ─── DOM Selectors (resilient) ───────────────────────────────────────────────
 
+    function invalidateChatLookupCache() {
+        chatLookupCache = null;
+    }
+
     function invalidateMesElCache() {
         mesElCache.clear();
         lastMesElCache.user = null;
         lastMesElCache.assistant = null;
+        invalidateChatLookupCache();
     }
 
     function normalizeMessageDomId(v) {
@@ -498,6 +529,45 @@
 
     // ─── Chat Data Readers ───────────────────────────────────────────────────────
 
+    function getChatLookupKey(value) {
+        if (value == null || value === '') return null;
+        if (typeof value === 'number') {
+            return Number.isFinite(value) ? String(value) : null;
+        }
+        if (typeof value === 'string') {
+            const trimmed = value.trim();
+            return trimmed === '' ? null : trimmed;
+        }
+        return null;
+    }
+
+    function getChatLookup() {
+        const ctx = globalThis.SillyTavern?.getContext?.();
+        const chat = ctx?.chat;
+        if (!chat) return null;
+
+        const chatId = ctx.chatId || null;
+        if (chatLookupCache
+            && chatLookupCache.chat === chat
+            && chatLookupCache.chatId === chatId
+            && chatLookupCache.length === chat.length) {
+            return chatLookupCache;
+        }
+
+        const idToIndex = new Map();
+        for (let i = chat.length - 1; i >= 0; i--) {
+            const msg = chat[i];
+            if (!msg) continue;
+            const key = getChatLookupKey(msg.mesid ?? msg.mesId ?? msg.message_id);
+            if (key != null && !idToIndex.has(key)) {
+                idToIndex.set(key, i);
+            }
+        }
+
+        chatLookupCache = { chat, chatId, length: chat.length, idToIndex };
+        return chatLookupCache;
+    }
+
     function getMesIdFromChatIndex(index) {
         const chat = SillyTavern.getContext().chat;
         const msg = chat && index != null ? chat[index] : null;
@@ -509,15 +579,15 @@
     }
 
     function findChatIndexByMesId(mesId) {
-        const chat = SillyTavern.getContext().chat;
+        const lookup = getChatLookup();
+        const chat = lookup?.chat;
         if (!chat || mesId == null) return null;
-        for (let i = chat.length - 1; i >= 0; i--) {
-            const msg = chat[i];
-            if (!msg) continue;
-            const mid = msg.mesid ?? msg.mesId ?? msg.message_id;
-            if (mid === mesId) return i;
-            if (typeof mid === 'string' && String(mesId) === mid) return i;
+
+        const key = getChatLookupKey(mesId);
+        if (key != null && lookup.idToIndex.has(key)) {
+            return lookup.idToIndex.get(key);
         }
+
         // If SillyTavern has no stable message ids, allow array-index fallback.
         // Do not let an old stable mesid accidentally resolve to a different
         // message that happens to occupy the same numeric array slot.
@@ -530,7 +600,8 @@
     }
 
     function findChatIndexByEventId(messageId) {
-        const chat = SillyTavern.getContext().chat;
+        const lookup = getChatLookup();
+        const chat = lookup?.chat;
         if (!chat || messageId == null) return null;
 
         const chatIndex = findChatIndexByMesId(messageId);
@@ -1021,6 +1092,7 @@
             swipeDebounceTimer = null;
         }
         swipeRenderSeq++;
+        editsButtonScanSeq++;
         log('State cleared');
     }
 
@@ -1067,7 +1139,7 @@
             // MESSAGE_SWIPED in that case, so re-render the linked user bubble
             // for the currently-selected swipe (no-op when no mapping exists).
             scheduleSwipeRenderAfterFrame(null, { skipWhileGenerating: true });
-            ensureEditsButtonsForLoadedChat();
+            scheduleEditsButtonsForLoadedChat();
         });
     }
 
@@ -1230,7 +1302,8 @@
             attachObserver();
             const renderedIdx = messageIndex != null ? findChatIndexByEventId(messageIndex) : getLastAssistantIndexFromChat();
             const renderedEl = renderedIdx != null ? getMesElForChatIndex(renderedIdx) : null;
-            if (renderedEl) ensureEditsButton(renderedEl);
+            const chat = SillyTavern.getContext().chat;
+            if (renderedEl) ensureEditsButton(renderedEl, renderedIdx, chat?.[renderedIdx]);
             // Ensure the currently visible swipe (usually 0) has a mapping.
             const chatIndex = messageIndex != null ? findChatIndexByEventId(messageIndex) : null;
             if (chatIndex != null) {
@@ -1672,26 +1745,31 @@
 
     const EDITS_BUTTON_CLASS = 'swipe_edits_view_button';
 
+    function shouldShowEditsButton(msg) {
+        if (!msg || msg.is_user || msg.is_system) return false;
+        const hasMultipleSwipes = Array.isArray(msg.swipes) && msg.swipes.length > 1;
+        const hasAnyLinked = Array.isArray(msg.swipe_info)
+            && msg.swipe_info.some((si) => typeof si?.extra?.linked_user_text === 'string');
+        return hasMultipleSwipes || hasAnyLinked;
+    }
+
     /**
      * Add (or remove) the per-message "view linked edits" button on an AI message.
      * The button is only shown when there is something to show — i.e. the message
      * has more than one swipe or at least one recorded linked_user_text. Idempotent.
      */
-    function ensureEditsButton(mesEl) {
+    function ensureEditsButton(mesEl, knownChatIndex = null, knownMsg = undefined) {
         if (!mesEl || mesEl.getAttribute('is_user') === 'true' || mesEl.getAttribute('is_system') === 'true') return;
         const extraBtns = mesEl.querySelector('.extraMesButtons');
         if (!extraBtns) return;
-        const chatIndex = getChatIndexForMesEl(mesEl);
-        const msg = chatIndex != null ? SillyTavern.getContext().chat?.[chatIndex] : null;
+        const chatIndex = knownChatIndex != null ? knownChatIndex : getChatIndexForMesEl(mesEl);
+        const msg = knownMsg !== undefined ? knownMsg : (chatIndex != null ? SillyTavern.getContext().chat?.[chatIndex] : null);
         const existing = extraBtns.querySelector(`.${EDITS_BUTTON_CLASS}`);
         if (!msg || msg.is_user || msg.is_system) {
             if (existing) existing.remove();
             return;
         }
-        const hasMultipleSwipes = Array.isArray(msg.swipes) && msg.swipes.length > 1;
-        const hasAnyLinked = Array.isArray(msg.swipe_info)
-            && msg.swipe_info.some((si) => typeof si?.extra?.linked_user_text === 'string');
-        if (!hasMultipleSwipes && !hasAnyLinked) {
+        if (!shouldShowEditsButton(msg)) {
             if (existing) existing.remove();
             return;
         }
@@ -1703,17 +1781,57 @@
         extraBtns.appendChild(btn);
     }
 
-    function ensureEditsButtonsForLoadedChat() {
-        const chatEl = document.getElementById('chat');
-        if (!chatEl) return;
-        chatEl.querySelectorAll('.mes').forEach((el) => ensureEditsButton(el));
+    function ensureEditsButtonForLoadedMessage(el, chat) {
+        if (!el) return;
+        if (el.getAttribute('is_user') === 'true' || el.getAttribute('is_system') === 'true') {
+            el.querySelector(`.${EDITS_BUTTON_CLASS}`)?.remove();
+            return;
+        }
+        const chatIndex = getChatIndexForMesEl(el);
+        const msg = chatIndex != null ? chat?.[chatIndex] : null;
+        ensureEditsButton(el, chatIndex, msg);
+    }
+
+    function scheduleEditsButtonsForLoadedChat() {
+        const seq = ++editsButtonScanSeq;
+        scheduleIdleTask(() => {
+            if (seq !== editsButtonScanSeq || !isCurrentInstance()) return;
+            const chatEl = document.getElementById('chat');
+            const chat = SillyTavern.getContext().chat;
+            if (!chatEl || !chat) return;
+
+            const nodes = Array.from(chatEl.querySelectorAll('.mes'));
+            let index = 0;
+            const processChunk = (deadline) => {
+                if (seq !== editsButtonScanSeq || !isCurrentInstance()) return;
+                if (SillyTavern.getContext().chat !== chat) return;
+
+                let processed = 0;
+                while (index < nodes.length) {
+                    ensureEditsButtonForLoadedMessage(nodes[index], chat);
+                    index++;
+                    processed++;
+
+                    const timeRemaining = typeof deadline?.timeRemaining === 'function' ? deadline.timeRemaining() : 0;
+                    if (processed >= 40 && timeRemaining < 4) break;
+                    if (processed >= 100) break;
+                }
+
+                if (index < nodes.length) {
+                    scheduleIdleTask(processChunk);
+                }
+            };
+
+            processChunk();
+        });
     }
 
     function ensureEditsButtonForAssistant(assistantIndexOrMesId) {
         if (assistantIndexOrMesId == null) return;
         const chatIndex = findChatIndexByMesId(assistantIndexOrMesId);
         const mesEl = chatIndex != null ? getMesElForChatIndex(chatIndex) : null;
-        if (mesEl) ensureEditsButton(mesEl);
+        const msg = chatIndex != null ? SillyTavern.getContext().chat?.[chatIndex] : null;
+        if (mesEl) ensureEditsButton(mesEl, chatIndex, msg);
     }
 
     function showEditsPopup(mesEl) {
@@ -1868,12 +1986,20 @@
         removeAllEditsButtons();
         hasMessageSwipedEvent = false;
         document.removeEventListener('click', onDocumentClick);
+        document.removeEventListener('DOMContentLoaded', bootWithRuntimeBus);
+        if (globalThis.swipeLinkedUserEditTeardown === teardown) {
+            delete globalThis.swipeLinkedUserEditTeardown;
+        }
+        if (globalThis[INSTANCE_KEY] === instanceToken) {
+            delete globalThis[INSTANCE_KEY];
+        }
         log('Extension torn down');
     }
 
     globalThis.swipeLinkedUserEditTeardown = teardown;
 
     function init() {
+        if (!isCurrentInstance()) return;
         const ctx = SillyTavern.getContext();
         const { eventSource, event_types } = ctx;
 
@@ -1919,19 +2045,21 @@
 
         // Initial capture for already-loaded chat
         requestAnimationFrame(() => {
+            if (!isCurrentInstance()) return;
             lastChatId = ctx.chatId || null;
             captureCurrentState();
             attachObserver();
             // On first load the chat may already be sitting on a non-latest swipe.
             // Render its linked user bubble (no-op when no mapping exists).
             scheduleSwipeRenderAfterFrame(null, { skipWhileGenerating: true });
-            ensureEditsButtonsForLoadedChat();
+            scheduleEditsButtonsForLoadedChat();
         });
 
         log('Extension initialized');
     }
 
     function boot(retries = 0) {
+        if (!isCurrentInstance()) return;
         const maxRetries = 100;
         if (!globalThis.SillyTavern?.getContext) {
             if (retries < maxRetries) return setTimeout(() => boot(retries + 1), 100);
@@ -1948,6 +2076,7 @@
     }
 
     async function bootWithRuntimeBus() {
+        if (!isCurrentInstance()) return;
         const runtimeBus = globalThis.STRuntimeBus;
         if (!runtimeBus?.waitForContext) {
             boot();
@@ -1956,6 +2085,7 @@
 
         try {
             await runtimeBus.waitForContext({ timeoutMs: 10000 });
+            if (!isCurrentInstance()) return;
             init();
         } catch (error) {
             console.warn(`[${EXTENSION_NAME}] Runtime bus context wait failed; falling back to local boot`, error);
@@ -1965,7 +2095,7 @@
 
     // Run init once DOM is ready
     if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', bootWithRuntimeBus);
+        document.addEventListener('DOMContentLoaded', bootWithRuntimeBus, { once: true });
     } else {
         bootWithRuntimeBus();
     }
