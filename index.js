@@ -37,6 +37,9 @@
     const mesElCache = new Map(); // mesId -> Element cache for getMesElByIndex
     let lastMesElCache = { user: null, assistant: null }; // cached results for getLastMesEl
     let chatLookupCache = null; // O(1) mesid -> chat index cache for the active chat
+    const userBubbleRenderState = new WeakMap(); // Element -> last raw text/html we rendered
+    const formattedUserMessageCache = new Map(); // raw user text + message context -> formatted HTML
+    const USER_FORMAT_CACHE_LIMIT = 200;
     const eventSubscriptions = [];
 
     // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -224,22 +227,95 @@
         });
     }
 
-    function formatUserMessageText(rawText, chatIndex) {
+    function getUserFormatCacheKey(rawText, chatIndex) {
+        if (typeof rawText !== 'string') return null;
         const ctx = SillyTavern.getContext();
+        const msg = ctx.chat?.[chatIndex];
+        const mesId = getMesIdFromChatIndex(chatIndex);
+        const userName = msg?.name || ctx.name1 || 'User';
+        return JSON.stringify([
+            ctx.chatId || '',
+            mesId ?? chatIndex ?? '',
+            userName,
+            Boolean(msg?.is_system),
+            rawText,
+        ]);
+    }
+
+    function rememberFormattedUserMessage(cacheKey, html) {
+        if (!cacheKey || typeof html !== 'string') return;
+        if (!formattedUserMessageCache.has(cacheKey) && formattedUserMessageCache.size >= USER_FORMAT_CACHE_LIMIT) {
+            const oldestKey = formattedUserMessageCache.keys().next().value;
+            formattedUserMessageCache.delete(oldestKey);
+        }
+        formattedUserMessageCache.set(cacheKey, html);
+    }
+
+    function formatUserMessageText(rawText, chatIndex) {
+        const cacheKey = getUserFormatCacheKey(rawText, chatIndex);
+        if (cacheKey && formattedUserMessageCache.has(cacheKey)) {
+            return formattedUserMessageCache.get(cacheKey);
+        }
+
+        const ctx = SillyTavern.getContext();
+        let html = null;
         if (typeof ctx.messageFormatting === 'function') {
             const msg = ctx.chat?.[chatIndex];
             const userName = msg?.name || ctx.name1 || 'User';
             const mesId = getMesIdFromChatIndex(chatIndex);
             try {
-                return ctx.messageFormatting(rawText, userName, msg?.is_system || false, true, mesId, {}, false);
+                html = ctx.messageFormatting(rawText, userName, msg?.is_system || false, true, mesId, {}, false);
             } catch (e) {
                 console.warn(`[${EXTENSION_NAME}] messageFormatting error:`, e);
             }
         }
-        // Fallback: escape HTML
-        const div = document.createElement('div');
-        div.textContent = rawText;
-        return div.innerHTML;
+        if (typeof html !== 'string') {
+            // Fallback: escape HTML
+            const div = document.createElement('div');
+            div.textContent = rawText;
+            html = div.innerHTML;
+        }
+        rememberFormattedUserMessage(cacheKey, html);
+        return html;
+    }
+
+    function markUserBubbleRenderState(mesEl, textEl, rawText, chatIndex) {
+        if (!mesEl || !textEl || typeof rawText !== 'string') return;
+        userBubbleRenderState.set(mesEl, {
+            chatIndex,
+            rawText,
+            html: textEl.innerHTML,
+        });
+    }
+
+    function isUserBubbleRendered(mesEl, textEl, rawText, chatIndex) {
+        if (!mesEl || !textEl || typeof rawText !== 'string') return false;
+
+        const rendered = userBubbleRenderState.get(mesEl);
+        if (rendered
+            && rendered.chatIndex === chatIndex
+            && rendered.rawText === rawText
+            && rendered.html === textEl.innerHTML) {
+            return true;
+        }
+
+        if (textEl.textContent.trim() === rawText.trim()) {
+            markUserBubbleRenderState(mesEl, textEl, rawText, chatIndex);
+            return true;
+        }
+
+        return false;
+    }
+
+    function renderUserBubbleText(mesEl, textEl, rawText, chatIndex) {
+        if (isUserBubbleRendered(mesEl, textEl, rawText, chatIndex)) return false;
+
+        const html = formatUserMessageText(rawText, chatIndex);
+        if (textEl.innerHTML !== html) {
+            textEl.innerHTML = html;
+        }
+        markUserBubbleRenderState(mesEl, textEl, rawText, chatIndex);
+        return true;
     }
 
     function getUserDisplayText(msg) {
@@ -275,7 +351,7 @@
         const rawText = getUserDisplayText(msg);
         if (typeof rawText !== 'string') return;
 
-        textEl.innerHTML = formatUserMessageText(rawText, chatIndex);
+        renderUserBubbleText(mesEl, textEl, rawText, chatIndex);
     }
 
     function ensureMappingForAssistantMesId(assistantMesId, { setActive = true } = {}) {
@@ -932,13 +1008,13 @@
             return;
         }
 
-        if (textEl.textContent.trim() === userText.trim()) {
+        if (isUserBubbleRendered(userEl, textEl, userText, userIndex)) {
             userEl.setAttribute('data-swipe-linked', '1');
             return;
         }
 
         log('Updating user bubble to:', userText.substring(0, 60));
-        textEl.innerHTML = formatUserMessageText(userText, userIndex);
+        renderUserBubbleText(userEl, textEl, userText, userIndex);
         userEl.setAttribute('data-swipe-linked', '1');
     }
 
@@ -1087,6 +1163,7 @@
         pendingSwipeGenerationKey = null;
         detachObserver();
         invalidateMesElCache();
+        formattedUserMessageCache.clear();
         if (swipeDebounceTimer) {
             clearTimeout(swipeDebounceTimer);
             swipeDebounceTimer = null;
@@ -1400,6 +1477,7 @@
 
     function onMessageEdited(messageIndex) {
         messageIndex = normalizeMessageIndex(messageIndex);
+        formattedUserMessageCache.clear();
         const chat = SillyTavern.getContext().chat;
         if (!chat || messageIndex == null) return;
 
