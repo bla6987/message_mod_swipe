@@ -40,6 +40,21 @@ Then enable the extension in **Extensions > Manage Extensions** within SillyTave
 
 It works transparently with the existing swipe arrows and hotkeys — no config UI.
 
+### Send a corrected user message without swiping
+
+If you only need to fix a typo or small wording issue in a previous user
+message, you can mark that user message to be used in future prompt context
+without generating a new AI swipe:
+
+1. Edit the user message and confirm the edit.
+2. Open that user message's `...` actions menu.
+3. Click the document-check icon to mark it for future context.
+4. Send your next message normally.
+
+Marked user messages get a subtle green indicator. Click the same icon again to
+turn the context override off. If you edit the marked message again, the stored
+context text updates automatically.
+
 ### View linked edits
 
 AI messages that have more than one swipe (or any recorded edit) get a small
@@ -69,6 +84,7 @@ Debug logs are prefixed with `[swipe_linked_user_edit]`.
 1. `GENERATION_AFTER_COMMANDS` — snapshots user text for regeneration-like flows (`swipe`/`regenerate`/`continue`) before prompt assembly.
 2. `MESSAGE_SENT` + `MESSAGE_RECEIVED` — for `normal` sends, captures the just-sent user text at `MESSAGE_SENT` and writes it at `MESSAGE_RECEIVED`.
 3. Per-swipe persistence — generated variants store `linked_user_text` on `swipe_info[swipeId].extra`, with the active swipe mirrored to `msg.extra.linked_user_text` for SillyTavern's swipe sync.
-4. Swipe detection (SillyTavern's `MESSAGE_SWIPED` event, with DOM fallback) reads that per-swipe metadata and updates the displayed user bubble when a linked text exists.
-5. `generate_interceptor` — ephemerally patches `msg.mes` on the selected user message in the outgoing prompt array. Patch precedence is `edited > generation-start snapshot > linked swipe text` to avoid race-dependent stale prompts.
-6. `CHAT_CHANGED` — clears session-only lifecycle state. Persisted `swipe_info[].extra.linked_user_text` values remain in chat data and survive reloads, chat switches, and branching.
+4. User context override — marked user messages store `swipe_linked_context_override` on the user message itself, so future sends can prefer the corrected text without creating a new swipe.
+5. Swipe detection (SillyTavern's `MESSAGE_SWIPED` event, with DOM fallback) reads that per-swipe metadata and updates the displayed user bubble when a linked text exists, unless a user context override is active.
+6. `generate_interceptor` — ephemerally patches `msg.mes` on the selected user message in the outgoing prompt array. Patch precedence is `edited > marked context override > generation-start snapshot > linked swipe text` to avoid race-dependent stale prompts.
+7. `CHAT_CHANGED` — clears session-only lifecycle state. Persisted `swipe_info[].extra.linked_user_text` values and user-message context overrides remain in chat data and survive reloads, chat switches, and branching.

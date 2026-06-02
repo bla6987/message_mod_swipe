@@ -3,3 +3,12 @@
     border-left: 2px solid rgba(100, 200, 255, 0.35);
     padding-left: 6px;
 }
+
+.mes[data-context-override="1"] .mes_text {
+    border-left: 2px solid rgba(120, 220, 150, 0.45);
+    padding-left: 6px;
+}
+
+.swipe_context_override_button.active {
+    color: rgb(120, 220, 150);
+}

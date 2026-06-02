@@ -3,6 +3,7 @@
 
     const EXTENSION_NAME = 'swipe_linked_user_edit';
     const INSTANCE_KEY = '__swipeLinkedUserEditInstance';
+    const CONTEXT_OVERRIDE_EXTRA_KEY = 'swipe_linked_context_override';
 
     if (typeof globalThis.swipeLinkedUserEditTeardown === 'function') {
         try {
@@ -167,14 +168,66 @@
         return typeof getLinkedUserText(assistantMsg, swipeId) === 'string';
     }
 
+    function getContextOverrideText(userMsg) {
+        if (!userMsg || !userMsg.is_user) return null;
+        const override = userMsg.extra?.[CONTEXT_OVERRIDE_EXTRA_KEY];
+        if (!override || override.enabled !== true || typeof override.text !== 'string') return null;
+        return override.text;
+    }
+
+    function hasContextOverride(userMsg) {
+        return typeof getContextOverrideText(userMsg) === 'string';
+    }
+
+    function setContextOverrideText(userMsg, userText) {
+        if (!userMsg || !userMsg.is_user || typeof userText !== 'string') return false;
+        if (!userMsg.extra || typeof userMsg.extra !== 'object') {
+            userMsg.extra = {};
+        }
+        userMsg.extra[CONTEXT_OVERRIDE_EXTRA_KEY] = {
+            enabled: true,
+            text: userText,
+            updatedAt: Date.now(),
+        };
+        return true;
+    }
+
+    function clearContextOverride(userMsg) {
+        if (!userMsg?.extra || typeof userMsg.extra !== 'object') return false;
+        if (!(CONTEXT_OVERRIDE_EXTRA_KEY in userMsg.extra)) return false;
+        delete userMsg.extra[CONTEXT_OVERRIDE_EXTRA_KEY];
+        return true;
+    }
+
     function getLinkedTextByKey(key) {
         const parsed = parseMappingKey(key);
         if (!parsed) return null;
         return getLinkedUserText(resolveAssistantMsg(parsed.assistantMesId), parsed.swipeId);
     }
 
+    function getContextOverrideTextForAssistantMesId(assistantMesId) {
+        if (!Number.isFinite(assistantMesId)) return null;
+        const chat = SillyTavern.getContext().chat;
+        if (!chat) return null;
+        const assistantIdx = findChatIndexByMesId(assistantMesId);
+        if (assistantIdx == null) return null;
+        const userIdx = getUserIndexBefore(assistantIdx);
+        if (userIdx == null) return null;
+        return getContextOverrideText(chat[userIdx]);
+    }
+
+    function getContextOverrideTextForKey(key) {
+        const parsed = parseMappingKey(key);
+        if (!parsed) return null;
+        return getContextOverrideTextForAssistantMesId(parsed.assistantMesId);
+    }
+
     function hasLinkedTextByKey(key) {
         return typeof getLinkedTextByKey(key) === 'string';
+    }
+
+    function hasRenderableUserTextByKey(key) {
+        return hasLinkedTextByKey(key) || typeof getContextOverrideTextForKey(key) === 'string';
     }
 
     function requestChatSave() {
@@ -392,6 +445,7 @@
                 generationContext,
                 activeKey,
                 linkedUserText: activeKey ? getLinkedTextByKey(activeKey) : null,
+                contextOverrideText: activeKey ? getContextOverrideTextForKey(activeKey) : null,
                 aiIdx,
                 userIdx,
                 aiMsg: aiIdx != null && chat ? chat[aiIdx] : null,
@@ -429,6 +483,12 @@
             if (m && !Number.isNaN(Number(m[1]))) return Number(m[1]);
         }
         return null;
+    }
+
+    function elAttrIsTruthy(el, attr) {
+        if (!el || !attr) return false;
+        const value = (el.getAttribute(attr) || '').toLowerCase();
+        return value === 'true' || value === '1';
     }
 
     function getMesIdsFromElement(el) {
@@ -717,6 +777,32 @@
         return null;
     }
 
+    function getAssistantIndexesAfterUserIndex(userIndex) {
+        const chat = SillyTavern.getContext().chat;
+        if (!chat || userIndex == null || userIndex < 0) return [];
+        const assistantIndexes = [];
+        for (let i = userIndex + 1; i < chat.length; i++) {
+            const msg = chat[i];
+            if (!msg) continue;
+            if (msg.is_user) break;
+            if (!msg.is_system && hasAssistantContent(msg)) assistantIndexes.push(i);
+        }
+        return assistantIndexes;
+    }
+
+    function getPairedAssistantIndexForUserIndex(userIndex) {
+        const assistantIndexes = getAssistantIndexesAfterUserIndex(userIndex);
+        if (!assistantIndexes.length) return null;
+
+        const parsedActive = parseMappingKey(activeKey);
+        if (parsedActive) {
+            const activeIdx = findChatIndexByMesId(parsedActive.assistantMesId);
+            if (assistantIndexes.includes(activeIdx)) return activeIdx;
+        }
+
+        return assistantIndexes[assistantIndexes.length - 1];
+    }
+
     function getLastUserMesFromChat() {
         const chat = SillyTavern.getContext().chat;
         if (!chat) return null;
@@ -849,6 +935,9 @@
         if (pendingEditedEntry && sourceKey && pendingEditedEntry.key === sourceKey && typeof pendingEditedEntry.text === 'string') {
             sourceUserText = pendingEditedEntry.text;
         }
+        if (typeof sourceUserText !== 'string' && parsed?.assistantMesId != null) {
+            sourceUserText = getContextOverrideTextForAssistantMesId(parsed.assistantMesId);
+        }
         if (typeof sourceUserText !== 'string' && sourceKey) {
             const mappedText = getLinkedTextByKey(sourceKey);
             if (typeof mappedText === 'string') {
@@ -960,18 +1049,12 @@
 
     function updateUserBubbleForActiveKey() {
         if (!activeKey) return;
-        const userText = getLinkedTextByKey(activeKey);
-        if (userText == null) {
-            clearUserBubbleHighlightForActiveKey();
-            return;
-        }
-
-        const m = /^([0-9]+):([0-9]+)$/.exec(activeKey);
-        if (!m) {
+        const parsed = parseMappingKey(activeKey);
+        if (!parsed) {
             clearAnySwipeLinkedHighlight();
             return;
         }
-        const assistantMesId = Number(m[1]);
+        const assistantMesId = parsed.assistantMesId;
         const assistantChatIndex = findChatIndexByMesId(assistantMesId);
         if (assistantChatIndex == null) {
             log('Could not resolve assistant chat index for mesid', assistantMesId);
@@ -997,9 +1080,34 @@
             return;
         }
 
+        const chat = SillyTavern.getContext().chat;
+        const userMsg = chat?.[userIndex];
+        const overrideText = getContextOverrideText(userMsg);
+        const linkedText = getLinkedTextByKey(activeKey);
+        if (typeof overrideText === 'string') {
+            clearSwipeLinkedHighlightsExcept(userEl);
+            if (isUserBubbleRendered(userEl, textEl, overrideText, userIndex)) {
+                userEl.removeAttribute('data-swipe-linked');
+                userEl.setAttribute('data-context-override', '1');
+                return;
+            }
+
+            log('Updating user bubble to context override:', overrideText.substring(0, 60));
+            renderUserBubbleText(userEl, textEl, overrideText, userIndex);
+            userEl.removeAttribute('data-swipe-linked');
+            userEl.setAttribute('data-context-override', '1');
+            return;
+        }
+
+        userEl.removeAttribute('data-context-override');
+        const userText = linkedText;
+        if (userText == null) {
+            clearUserBubbleHighlightForActiveKey();
+            return;
+        }
+
         // Compare stored text against the canonical user message in chat data.
         // Only highlight if the text was actually modified for this swipe variant.
-        const chat = SillyTavern.getContext().chat;
         const originalUserText = chat && chat[userIndex] ? getUserDisplayText(chat[userIndex]) : null;
         if (originalUserText != null && userText.trim() === originalUserText.trim()) {
             // Text wasn't modified – restore formatted DOM and don't highlight
@@ -1049,7 +1157,7 @@
             clearAnySwipeLinkedHighlight();
             return;
         }
-        if (!hasLinkedTextByKey(activeKey)) {
+        if (!hasRenderableUserTextByKey(activeKey)) {
             log('No mapping for key', activeKey);
             clearUserBubbleHighlightForActiveKey();
             return;
@@ -1063,7 +1171,7 @@
             clearAnySwipeLinkedHighlight();
             return;
         }
-        if (!hasLinkedTextByKey(activeKey)) {
+        if (!hasRenderableUserTextByKey(activeKey)) {
             log('No mapping for key', activeKey);
             clearAnySwipeLinkedHighlight();
             return;
@@ -1326,13 +1434,20 @@
                 && pendingEditedEntry.key === keyUsedForGeneration
                 && typeof pendingEditedEntry.text === 'string') {
                 userTextForMapping = pendingEditedEntry.text;
-            } else if (generationContext
+            }
+            if (typeof userTextForMapping !== 'string' && keyUsedForGeneration) {
+                const overrideText = getContextOverrideTextForKey(keyUsedForGeneration);
+                if (typeof overrideText === 'string') {
+                    userTextForMapping = overrideText;
+                }
+            }
+            if (typeof userTextForMapping !== 'string' && generationContext
                 && typeof generationContext.sourceUserText === 'string'
                 && (!generationContext.sourceKey || generationContext.sourceKey === keyUsedForGeneration)) {
                 userTextForMapping = generationContext.sourceUserText;
-            } else if (typeof pendingUserText === 'string') {
+            } else if (typeof userTextForMapping !== 'string' && typeof pendingUserText === 'string') {
                 userTextForMapping = pendingUserText;
-            } else if (keyUsedForGeneration) {
+            } else if (typeof userTextForMapping !== 'string' && keyUsedForGeneration) {
                 const mappedText = getLinkedTextByKey(keyUsedForGeneration);
                 if (typeof mappedText === 'string') {
                     userTextForMapping = mappedText;
@@ -1381,6 +1496,8 @@
             const renderedEl = renderedIdx != null ? getMesElForChatIndex(renderedIdx) : null;
             const chat = SillyTavern.getContext().chat;
             if (renderedEl) ensureEditsButton(renderedEl, renderedIdx, chat?.[renderedIdx]);
+            const pairedUserIdx = renderedIdx != null ? getUserIndexBefore(renderedIdx) : null;
+            if (pairedUserIdx != null) ensureContextOverrideButtonForUserIndex(pairedUserIdx);
             // Ensure the currently visible swipe (usually 0) has a mapping.
             const chatIndex = messageIndex != null ? findChatIndexByEventId(messageIndex) : null;
             if (chatIndex != null) {
@@ -1463,6 +1580,8 @@
         // A fresh variant may have just crossed the "more than one swipe" threshold,
         // so (re)evaluate the edits button for this message.
         ensureEditsButtonForAssistant(aiIdx != null ? getMesIdFromChatIndex(aiIdx) : null);
+        const userIdx = aiIdx != null ? getUserIndexBefore(aiIdx) : null;
+        if (userIdx != null) ensureContextOverrideButtonForUserIndex(userIdx);
     }
 
     function onMessageUpdated(messageIndex) {
@@ -1471,7 +1590,17 @@
         const chat = SillyTavern.getContext().chat;
         const chatIndex = messageIndex != null ? findChatIndexByEventId(messageIndex) : null;
         const msg = chatIndex != null && chat ? chat[chatIndex] : null;
+        if (msg?.is_user) {
+            ensureContextOverrideButtonForUserIndex(chatIndex);
+            const pairedAssistantIndex = getPairedAssistantIndexForUserIndex(chatIndex);
+            scheduleSwipeRenderAfterFrame(pairedAssistantIndex != null ? getMesIdFromChatIndex(pairedAssistantIndex) : null);
+            return;
+        }
         const assistantMesId = msg && !msg.is_user && !msg.is_system ? getMesIdFromChatIndex(chatIndex) : null;
+        if (assistantMesId != null) {
+            const userIdx = getUserIndexBefore(chatIndex);
+            if (userIdx != null) ensureContextOverrideButtonForUserIndex(userIdx);
+        }
         scheduleSwipeRenderAfterFrame(assistantMesId);
     }
 
@@ -1490,13 +1619,12 @@
         }
         if (typeof editedText !== 'string') return;
 
-        const assistantIndexes = [];
-        for (let i = editedIndex + 1; i < chat.length; i++) {
-            const msg = chat[i];
-            if (!msg) continue;
-            if (msg.is_user) break;
-            if (!msg.is_system && hasAssistantContent(msg)) assistantIndexes.push(i);
+        if (hasContextOverride(chat[editedIndex]) && setContextOverrideText(chat[editedIndex], editedText)) {
+            requestChatSave();
         }
+
+        ensureContextOverrideButtonForUserIndex(editedIndex);
+        const assistantIndexes = getAssistantIndexesAfterUserIndex(editedIndex);
 
         if (!assistantIndexes.length) {
             activeKey = null;
@@ -1526,6 +1654,7 @@
 
         pendingEditedEntry = { key: keyAtEdit, text: editedText };
         log('MESSAGE_EDITED – pending keyed edit updated:', keyAtEdit, editedText.substring(0, 60), isLatestUser ? '(latest)' : '(non-latest)');
+        scheduleSwipeRenderAfterFrame(assistantMesId);
     }
 
     function onMessageDeleted(_chatLength) {
@@ -1575,6 +1704,7 @@
                 ensureMappingForAssistantMesId(getMesIdFromChatIndex(aiIdx));
             }
             handleSwipeChange();
+            scheduleEditsButtonsForLoadedChat();
         });
     }
 
@@ -1611,7 +1741,9 @@
         log('MESSAGE_SWIPE_DELETED – adjusted session keys for assistant', assistantMesId, 'deleted swipe', swipeId);
 
         refreshActiveKeyFromChat(assistantMesId);
-        if (!activeKey || !hasLinkedTextByKey(activeKey)) {
+        const userIdx = assistantIdx != null ? getUserIndexBefore(assistantIdx) : null;
+        if (userIdx != null) ensureContextOverrideButtonForUserIndex(userIdx);
+        if (!activeKey || !hasRenderableUserTextByKey(activeKey)) {
             clearUserBubbleHighlightForAssistant(assistantMesId);
             return;
         }
@@ -1654,9 +1786,10 @@
     /**
      * Patch every historical user turn that sits before an assistant message parked
      * on a NON-latest swipe, replacing its outgoing text with that swipe's linked
-     * user text. Used for `normal` sends, where the per-source-turn patch below does
-     * not run: without this, an earlier turn the user has swiped away from would be
-     * sent to the model as its latest-edited text rather than the branch's own text.
+     * user text unless the user message has an explicit context override. Used for
+     * `normal` sends, where the per-source-turn patch below does not run: without
+     * this, an earlier turn the user has swiped away from would be sent to the model
+     * as its latest-edited text rather than the branch's own text.
      *
      * Operates directly on the spread-copied coreChat entries (which carry
      * swipe_info/swipe_id/swipes), so no live-chat matching is needed. Only
@@ -1670,15 +1803,19 @@
             if (!aiMsg || aiMsg.is_user || aiMsg.is_system) continue;
             const swipes = Array.isArray(aiMsg.swipes) ? aiMsg.swipes : null;
             const swipeId = getSwipeIdFromMsg(aiMsg);
-            if (!swipes || swipeId >= swipes.length - 1) continue;
-            const linked = getLinkedUserText(aiMsg, swipeId);
-            if (typeof linked !== 'string') continue;
             let userIdx = -1;
             for (let j = i - 1; j >= 0; j--) {
                 if (chat[j]?.is_user) { userIdx = j; break; }
             }
             if (userIdx === -1) continue;
             const userMsg = chat[userIdx];
+            if (hasContextOverride(userMsg)) {
+                log('Interceptor (normal) kept context override for user idx', userIdx, 'before assistant idx', i);
+                continue;
+            }
+            if (!swipes || swipeId >= swipes.length - 1) continue;
+            const linked = getLinkedUserText(aiMsg, swipeId);
+            if (typeof linked !== 'string') continue;
             if (!userMsg || typeof userMsg !== 'object' || userMsg.mes === linked) continue;
             userMsg.mes = linked;
             log('Interceptor (normal) patched historical user idx', userIdx, 'for assistant idx', i, 'swipe', swipeId, 'to:', linked.substring(0, 60));
@@ -1716,15 +1853,23 @@
         if (pendingEditedEntry && pendingEditedEntry.key === keyToUse && typeof pendingEditedEntry.text === 'string') {
             textSource = 'edited';
             textToPatch = pendingEditedEntry.text;
-        } else if (generationContext
+        }
+        if (typeof textToPatch !== 'string') {
+            const overrideText = getContextOverrideTextForKey(keyToUse);
+            if (typeof overrideText === 'string') {
+                textSource = 'context_override';
+                textToPatch = overrideText;
+            }
+        }
+        if (typeof textToPatch !== 'string' && generationContext
             && typeof generationContext.sourceUserText === 'string'
             && (!generationContext.sourceKey || generationContext.sourceKey === keyToUse)) {
             textSource = 'context';
             textToPatch = generationContext.sourceUserText;
-        } else if (typeof pendingUserText === 'string') {
+        } else if (typeof textToPatch !== 'string' && typeof pendingUserText === 'string') {
             textSource = 'pending';
             textToPatch = pendingUserText;
-        } else {
+        } else if (typeof textToPatch !== 'string') {
             const mappedText = getLinkedTextByKey(keyToUse);
             if (typeof mappedText === 'string') {
                 textSource = 'mapped';
@@ -1809,6 +1954,11 @@
             return;
         }
 
+        if (textSource === 'context_override' && getContextOverrideText(msg) === textToPatch) {
+            log('Interceptor kept regexed context override at user msg idx', userIdx, 'with key', keyToUse);
+            return;
+        }
+
         // If already matching, skip
         if (msg.mes === textToPatch) return;
 
@@ -1822,6 +1972,7 @@
     // ─── "View linked edits" Button ──────────────────────────────────────────────
 
     const EDITS_BUTTON_CLASS = 'swipe_edits_view_button';
+    const CONTEXT_OVERRIDE_BUTTON_CLASS = 'swipe_context_override_button';
 
     function shouldShowEditsButton(msg) {
         if (!msg || msg.is_user || msg.is_system) return false;
@@ -1837,13 +1988,15 @@
      * has more than one swipe or at least one recorded linked_user_text. Idempotent.
      */
     function ensureEditsButton(mesEl, knownChatIndex = null, knownMsg = undefined) {
-        if (!mesEl || mesEl.getAttribute('is_user') === 'true' || mesEl.getAttribute('is_system') === 'true') return;
+        if (!mesEl) return;
         const extraBtns = mesEl.querySelector('.extraMesButtons');
         if (!extraBtns) return;
         const chatIndex = knownChatIndex != null ? knownChatIndex : getChatIndexForMesEl(mesEl);
         const msg = knownMsg !== undefined ? knownMsg : (chatIndex != null ? SillyTavern.getContext().chat?.[chatIndex] : null);
         const existing = extraBtns.querySelector(`.${EDITS_BUTTON_CLASS}`);
-        if (!msg || msg.is_user || msg.is_system) {
+        const isUserMessage = Boolean(msg?.is_user) || elAttrIsTruthy(mesEl, 'is_user');
+        const isSystemMessage = Boolean(msg?.is_system) || elAttrIsTruthy(mesEl, 'is_system');
+        if (!msg || isUserMessage || isSystemMessage) {
             if (existing) existing.remove();
             return;
         }
@@ -1859,14 +2012,83 @@
         extraBtns.appendChild(btn);
     }
 
-    function ensureEditsButtonForLoadedMessage(el, chat) {
-        if (!el) return;
-        if (el.getAttribute('is_user') === 'true' || el.getAttribute('is_system') === 'true') {
-            el.querySelector(`.${EDITS_BUTTON_CLASS}`)?.remove();
+    function syncContextOverrideButton(btn, msg) {
+        if (!btn) return;
+        const active = hasContextOverride(msg);
+        const title = active
+            ? 'Edited text will be sent in future context'
+            : 'Use edited text in future context';
+        btn.classList.toggle('active', active);
+        btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+        btn.title = title;
+        btn.setAttribute('data-i18n', `[title]${title}`);
+    }
+
+    function syncContextOverrideMarker(mesEl, msg) {
+        if (!mesEl) return;
+        if (hasContextOverride(msg)) {
+            mesEl.setAttribute('data-context-override', '1');
+        } else {
+            mesEl.removeAttribute('data-context-override');
+        }
+    }
+
+    function shouldShowContextOverrideButton(chatIndex, msg) {
+        if (!msg || !msg.is_user || msg.is_system) return false;
+        return hasContextOverride(msg) || getAssistantIndexesAfterUserIndex(chatIndex).length > 0;
+    }
+
+    function ensureContextOverrideButton(mesEl, knownChatIndex = null, knownMsg = undefined) {
+        if (!mesEl) return;
+        const chatIndex = knownChatIndex != null ? knownChatIndex : getChatIndexForMesEl(mesEl);
+        const msg = knownMsg !== undefined ? knownMsg : (chatIndex != null ? SillyTavern.getContext().chat?.[chatIndex] : null);
+        syncContextOverrideMarker(mesEl, msg);
+
+        const extraBtns = mesEl.querySelector('.extraMesButtons');
+        if (!extraBtns) return;
+        const existing = extraBtns.querySelector(`.${CONTEXT_OVERRIDE_BUTTON_CLASS}`);
+
+        if (!shouldShowContextOverrideButton(chatIndex, msg)) {
+            if (existing) existing.remove();
             return;
         }
+
+        let btn = existing;
+        if (!btn) {
+            btn = document.createElement('div');
+            btn.className = `mes_button ${CONTEXT_OVERRIDE_BUTTON_CLASS} fa-solid fa-file-circle-check`;
+            extraBtns.appendChild(btn);
+        }
+        syncContextOverrideButton(btn, msg);
+    }
+
+    function ensureContextOverrideButtonForUserIndex(userIndex) {
+        if (userIndex == null) return;
+        const chat = SillyTavern.getContext().chat;
+        const mesEl = getMesElForChatIndex(userIndex);
+        const msg = chat?.[userIndex];
+        if (mesEl) ensureContextOverrideButton(mesEl, userIndex, msg);
+    }
+
+    function ensureEditsButtonForLoadedMessage(el, chat) {
+        if (!el) return;
         const chatIndex = getChatIndexForMesEl(el);
         const msg = chatIndex != null ? chat?.[chatIndex] : null;
+        const isUserMessage = Boolean(msg?.is_user) || elAttrIsTruthy(el, 'is_user');
+        const isSystemMessage = Boolean(msg?.is_system) || elAttrIsTruthy(el, 'is_system');
+
+        if (isUserMessage || isSystemMessage) {
+            el.querySelector(`.${EDITS_BUTTON_CLASS}`)?.remove();
+            if (isUserMessage && !isSystemMessage) {
+                ensureContextOverrideButton(el, chatIndex, msg);
+            } else {
+                el.querySelector(`.${CONTEXT_OVERRIDE_BUTTON_CLASS}`)?.remove();
+                el.removeAttribute('data-context-override');
+            }
+            return;
+        }
+        el.querySelector(`.${CONTEXT_OVERRIDE_BUTTON_CLASS}`)?.remove();
+        el.removeAttribute('data-context-override');
         ensureEditsButton(el, chatIndex, msg);
     }
 
@@ -1910,6 +2132,35 @@
         const mesEl = chatIndex != null ? getMesElForChatIndex(chatIndex) : null;
         const msg = chatIndex != null ? SillyTavern.getContext().chat?.[chatIndex] : null;
         if (mesEl) ensureEditsButton(mesEl, chatIndex, msg);
+    }
+
+    function toggleContextOverrideForUserMessage(mesEl) {
+        const ctx = SillyTavern.getContext();
+        const chat = ctx.chat;
+        const chatIndex = getChatIndexForMesEl(mesEl);
+        const msg = chatIndex != null && chat ? chat[chatIndex] : null;
+        if (!msg || !msg.is_user) return;
+
+        if (hasContextOverride(msg)) {
+            clearContextOverride(msg);
+        } else {
+            let userText = getUserMessageText(msg);
+            if (typeof userText !== 'string') {
+                userText = getUserMesFromDomByMesId(getMesIdFromChatIndex(chatIndex));
+            }
+            if (typeof userText !== 'string') return;
+            setContextOverrideText(msg, userText);
+        }
+
+        requestChatSave();
+        ensureContextOverrideButton(mesEl, chatIndex, msg);
+
+        const pairedAssistantIndex = getPairedAssistantIndexForUserIndex(chatIndex);
+        if (pairedAssistantIndex != null) {
+            scheduleSwipeRenderAfterFrame(getMesIdFromChatIndex(pairedAssistantIndex));
+        } else {
+            restoreUserBubbleFromChat(mesEl);
+        }
     }
 
     function showEditsPopup(mesEl) {
@@ -2020,6 +2271,13 @@
             return;
         }
 
+        const contextOverrideBtn = target.closest(`.${CONTEXT_OVERRIDE_BUTTON_CLASS}`);
+        if (contextOverrideBtn) {
+            const mesEl = contextOverrideBtn.closest('.mes');
+            if (mesEl) toggleContextOverrideForUserMessage(mesEl);
+            return;
+        }
+
         // If MESSAGE_SWIPED event is available, let it handle swipe detection
         if (hasMessageSwipedEvent) return;
 
@@ -2055,7 +2313,8 @@
     }
 
     function removeAllEditsButtons() {
-        document.querySelectorAll(`.${EDITS_BUTTON_CLASS}`).forEach((el) => el.remove());
+        document.querySelectorAll(`.${EDITS_BUTTON_CLASS}, .${CONTEXT_OVERRIDE_BUTTON_CLASS}`).forEach((el) => el.remove());
+        document.querySelectorAll('#chat .mes[data-context-override="1"]').forEach((el) => el.removeAttribute('data-context-override'));
     }
 
     function teardown() {
