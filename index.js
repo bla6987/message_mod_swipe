@@ -827,37 +827,28 @@
         });
     }
 
-    function clearSwipeLinkedHighlightsExcept(exceptEl) {
-        const highlighted = document.querySelectorAll('#chat .mes[data-swipe-linked="1"]');
-        highlighted.forEach((el) => {
-            if (el === exceptEl) return;
-            restoreUserBubbleFromChat(el);
-            el.removeAttribute('data-swipe-linked');
-        });
-    }
-
-    function clearUserBubbleHighlightForAssistant(assistantMesId) {
+    function clearUserBubbleHighlightForAssistant(assistantMesId, { globalFallback = true } = {}) {
         if (assistantMesId == null) {
-            clearAnySwipeLinkedHighlight();
+            if (globalFallback) clearAnySwipeLinkedHighlight();
             return;
         }
 
         const assistantChatIndex = findChatIndexByMesId(assistantMesId);
         if (assistantChatIndex == null) {
-            clearAnySwipeLinkedHighlight();
+            if (globalFallback) clearAnySwipeLinkedHighlight();
             return;
         }
 
         const userIndex = getUserIndexBefore(assistantChatIndex);
         if (userIndex == null) {
-            clearAnySwipeLinkedHighlight();
+            if (globalFallback) clearAnySwipeLinkedHighlight();
             return;
         }
 
         const userEl = getMesElForChatIndex(userIndex);
         if (!userEl) {
             log('Could not resolve exact user message DOM element for index', userIndex);
-            clearAnySwipeLinkedHighlight();
+            if (globalFallback) clearAnySwipeLinkedHighlight();
             return;
         }
 
@@ -867,57 +858,56 @@
         userEl.removeAttribute('data-swipe-linked');
     }
 
-    function clearUserBubbleHighlightForActiveKey() {
+    function clearUserBubbleHighlightForActiveKey({ globalFallback = true } = {}) {
         if (!activeKey) {
-            clearAnySwipeLinkedHighlight();
+            if (globalFallback) clearAnySwipeLinkedHighlight();
             return;
         }
 
         const m = /^([0-9]+):([0-9]+)$/.exec(activeKey);
         if (!m) {
-            clearAnySwipeLinkedHighlight();
+            if (globalFallback) clearAnySwipeLinkedHighlight();
             return;
         }
 
-        clearUserBubbleHighlightForAssistant(Number(m[1]));
+        clearUserBubbleHighlightForAssistant(Number(m[1]), { globalFallback });
     }
 
-    function updateUserBubbleForActiveKey() {
+    function updateUserBubbleForActiveKey({ globalFallback = true } = {}) {
         if (!activeKey) return;
         const userText = getLinkedTextByKey(activeKey);
         if (userText == null) {
-            clearUserBubbleHighlightForActiveKey();
+            clearUserBubbleHighlightForActiveKey({ globalFallback });
             return;
         }
 
         const m = /^([0-9]+):([0-9]+)$/.exec(activeKey);
         if (!m) {
-            clearAnySwipeLinkedHighlight();
+            if (globalFallback) clearAnySwipeLinkedHighlight();
             return;
         }
         const assistantMesId = Number(m[1]);
         const assistantChatIndex = findChatIndexByMesId(assistantMesId);
         if (assistantChatIndex == null) {
             log('Could not resolve assistant chat index for mesid', assistantMesId);
-            clearAnySwipeLinkedHighlight();
+            if (globalFallback) clearAnySwipeLinkedHighlight();
             return;
         }
         const userIndex = getUserIndexBefore(assistantChatIndex);
         if (userIndex == null) {
-            clearAnySwipeLinkedHighlight();
+            if (globalFallback) clearAnySwipeLinkedHighlight();
             return;
         }
 
         const userEl = getMesElForChatIndex(userIndex);
         if (!userEl) {
             log('Could not resolve exact user message DOM element for index', userIndex);
-            clearAnySwipeLinkedHighlight();
+            if (globalFallback) clearAnySwipeLinkedHighlight();
             return;
         }
-        clearSwipeLinkedHighlightsExcept(userEl);
         const textEl = getMesTextEl(userEl);
         if (!textEl) {
-            clearAnySwipeLinkedHighlight();
+            if (globalFallback) clearAnySwipeLinkedHighlight();
             return;
         }
 
@@ -968,31 +958,22 @@
     // ─── Swipe Detection & Handling ──────────────────────────────────────────────
 
     function handleSwipeChange() {
-        refreshActiveKeyFromChat();
-        if (!activeKey) {
-            clearAnySwipeLinkedHighlight();
-            return;
-        }
-        if (!hasLinkedTextByKey(activeKey)) {
-            log('No mapping for key', activeKey);
-            clearUserBubbleHighlightForActiveKey();
-            return;
-        }
-        updateUserBubbleForActiveKey();
+        const aiIdx = getLastAssistantIndexFromChat();
+        handleSwipeChangeForAssistant(aiIdx != null ? getMesIdFromChatIndex(aiIdx) : null);
     }
 
     function handleSwipeChangeForAssistant(assistantIndexOrMesId = null) {
         refreshActiveKeyFromChat(assistantIndexOrMesId);
         if (!activeKey) {
-            clearAnySwipeLinkedHighlight();
+            clearUserBubbleHighlightForAssistant(assistantIndexOrMesId, { globalFallback: false });
             return;
         }
         if (!hasLinkedTextByKey(activeKey)) {
             log('No mapping for key', activeKey);
-            clearAnySwipeLinkedHighlight();
+            clearUserBubbleHighlightForActiveKey({ globalFallback: false });
             return;
         }
-        updateUserBubbleForActiveKey();
+        updateUserBubbleForActiveKey({ globalFallback: false });
     }
 
     function scheduleSwipeCheck(assistantIndexOrMesId = null) {
@@ -1534,10 +1515,10 @@
 
         refreshActiveKeyFromChat(assistantMesId);
         if (!activeKey || !hasLinkedTextByKey(activeKey)) {
-            clearUserBubbleHighlightForAssistant(assistantMesId);
+            clearUserBubbleHighlightForAssistant(assistantMesId, { globalFallback: false });
             return;
         }
-        updateUserBubbleForActiveKey();
+        updateUserBubbleForActiveKey({ globalFallback: false });
     }
 
     function onMessageSent(messageIndex) {
