@@ -51,6 +51,9 @@
     let editsButtonScanSeq = 0; // Guards chunked loaded-chat button scans
     const mesElCache = new Map(); // mesId -> Element cache for getMesElByIndex
     let lastMesElCache = { user: null, assistant: null }; // cached results for getLastMesEl
+    let generationWatchdogTimer = null; // clears isGenerating if a started generation never progresses
+    const GENERATION_START_WATCHDOG_MS = 10000; // grace period before treating a stuck generation as aborted
+    let stPromptHelpers; // undefined = not tried, null = unavailable, object = SillyTavern prompt-processing fns
     let chatLookupCache = null; // O(1) mesid -> chat index cache for the active chat
     const eventSubscriptions = [];
 
@@ -189,6 +192,34 @@
 
     function hasLinkedUserText(assistantMsg, swipeId = null) {
         return typeof getLinkedUserText(assistantMsg, swipeId) === 'string';
+    }
+
+    /**
+     * Record the same linked user text on sibling swipes generated in the SAME
+     * batch as the active one (streaming multi-swipe / "generate alternatives"),
+     * which SillyTavern appends before MESSAGE_RECEIVED. Siblings are matched by a
+     * shared swipe_info.send_date so variants from earlier edits/generations — which
+     * legitimately have their own (or no) linked text — are never overwritten.
+     */
+    function backfillBatchSwipeMappings(assistantMsg, assistantMesId, activeSwipeId, userText) {
+        if (!assistantMsg || typeof userText !== 'string') return;
+        const swipes = assistantMsg.swipes;
+        const swipeInfo = assistantMsg.swipe_info;
+        if (!Array.isArray(swipes) || swipes.length <= 1 || !Array.isArray(swipeInfo)) return;
+        const activeDate = swipeInfo[activeSwipeId]?.send_date ?? assistantMsg.send_date;
+        if (activeDate == null) return;
+        let wroteAny = false;
+        for (let i = 0; i < swipes.length; i++) {
+            if (i === activeSwipeId) continue;
+            const info = swipeInfo[i];
+            if (!info || info.send_date !== activeDate) continue; // different generation — leave it
+            if (typeof info.extra?.linked_user_text === 'string') continue; // already mapped
+            if (setLinkedUserText(assistantMsg, i, userText)) wroteAny = true;
+        }
+        if (wroteAny) {
+            requestChatSave();
+            log('Backfilled linked text for batch swipe alternatives of assistant', assistantMesId);
+        }
     }
 
     function getLinkedTextByKey(key) {
@@ -473,9 +504,13 @@
     function getMesElByIndex(index) {
         if (index == null || index < 0) return null;
 
-        // Return cached element if still in the DOM
+        // Return cached element only if it is still in the DOM AND still carries
+        // this index. A message move (messageEditMove) swaps mesids on existing
+        // nodes without an event we handle, so a still-connected cached node can
+        // now belong to a different index — re-validate before trusting it.
         const cached = mesElCache.get(index);
-        if (cached && cached.isConnected) return cached;
+        if (cached && cached.isConnected && getMesIdsFromElement(cached).includes(index)) return cached;
+        if (cached) mesElCache.delete(index);
 
         const selectors = [
             `#chat .mes[mesid="${index}"]`,
@@ -1140,6 +1175,10 @@
         // skipWhileGenerating renders; bumping the seq cancels delayed cleanups.
         isGenerating = false;
         generationSeq++;
+        if (generationWatchdogTimer) {
+            clearTimeout(generationWatchdogTimer);
+            generationWatchdogTimer = null;
+        }
         detachObserver();
         invalidateMesElCache();
         if (swipeDebounceTimer) {
@@ -1245,6 +1284,26 @@
             }
         }
         log('GENERATION_STARTED – pending:', pendingUserText && pendingUserText.substring(0, 60), 'key:', generationKey, 'ctx:', generationContext);
+        scheduleGenerationStartWatchdog();
+    }
+
+    // SillyTavern fires GENERATION_STARTED even for sends later aborted by a slash
+    // command, and that abort path (unblockGeneration) emits no generation-ended
+    // event — so the isGenerating flag set above would never clear. Every path that
+    // actually proceeds bumps generationSeq (GENERATION_AFTER_COMMANDS) or replaces
+    // state; if the seq is unchanged after a grace period the generation never
+    // progressed, so clear the stuck flag. A false positive on a slow-but-real
+    // command self-corrects, since AFTER_COMMANDS re-sets isGenerating.
+    function scheduleGenerationStartWatchdog() {
+        if (generationWatchdogTimer) clearTimeout(generationWatchdogTimer);
+        const seqAtStart = generationSeq;
+        generationWatchdogTimer = setTimeout(() => {
+            generationWatchdogTimer = null;
+            if (generationSeq === seqAtStart && isGenerating) {
+                isGenerating = false;
+                log('GENERATION_STARTED watchdog – generation never progressed; cleared stuck isGenerating');
+            }
+        }, GENERATION_START_WATCHDOG_MS);
     }
 
     function onMessageReceived(messageIndex, messageType) {
@@ -1334,6 +1393,10 @@
         if (!storedKey) return;
         didReceiveMessageForGeneration = true;
         pendingSwipeGenerationKey = null;
+        // Streaming can append several swipe alternatives in one generation before
+        // MESSAGE_RECEIVED, all from the same user text. Backfill the siblings so
+        // swiping to a batch alternative still resolves a linked bubble.
+        backfillBatchSwipeMappings(msg, assistantMesId, swipeId, userTextForMapping);
         if (effectiveType === 'normal') {
             pendingNormalUserText = null;
         } else {
@@ -1660,6 +1723,77 @@
 
     // ─── Generate Interceptor ────────────────────────────────────────────────────
 
+    // SillyTavern builds each coreChat entry as `[fileContent +] USER_INPUT-regex(mes)
+    // [+ titles]` BEFORE extension interceptors run. Swapping in raw linked text would
+    // drop that prompt-time regex output, prepended file contents, and appended
+    // file/media titles. These helpers re-apply the same pipeline using SillyTavern's
+    // own functions, loaded lazily by absolute URL (stable across install locations).
+    // If they can't be loaded we fall back to patching the raw text (previous behavior).
+    async function loadPromptHelpers() {
+        if (stPromptHelpers !== undefined) return stPromptHelpers;
+        try {
+            const [regexMod, chatsMod] = await Promise.all([
+                import('/scripts/extensions/regex/engine.js'),
+                import('/scripts/chats.js'),
+            ]);
+            const getRegexedString = regexMod?.getRegexedString;
+            const regexPlacement = regexMod?.regex_placement;
+            const appendFileContent = chatsMod?.appendFileContent;
+            if (typeof getRegexedString === 'function'
+                && regexPlacement && regexPlacement.USER_INPUT != null
+                && typeof appendFileContent === 'function') {
+                stPromptHelpers = { getRegexedString, regexPlacement, appendFileContent };
+            } else {
+                stPromptHelpers = null;
+            }
+        } catch {
+            stPromptHelpers = null;
+        }
+        if (!stPromptHelpers) {
+            log('Prompt preprocessing helpers unavailable; linked text will be patched raw');
+        }
+        return stPromptHelpers;
+    }
+
+    /**
+     * Rebuild a coreChat user entry's `mes` from replacement text exactly as
+     * SillyTavern's Generate() would (USER_INPUT regex, prepended file content,
+     * appended titles), so a linked-text swap keeps the same prompt-time processing.
+     * `coreChatItem` is the spread-copied entry (carries `extra` and `index`);
+     * `coreChat` is the array passed to the interceptor. Falls back to the raw text.
+     */
+    async function reprocessUserTextForPrompt(coreChat, coreChatItem, text, interceptorType) {
+        if (typeof text !== 'string') return text;
+        const helpers = await loadPromptHelpers();
+        if (!helpers) return text;
+        try {
+            const isContinue = interceptorType === 'continue';
+            const index = typeof coreChatItem.index === 'number'
+                ? coreChatItem.index
+                : coreChat.indexOf(coreChatItem);
+            const depth = coreChat.length - index - (isContinue ? 2 : 1);
+            let processed = helpers.getRegexedString(text, helpers.regexPlacement.USER_INPUT, { isPrompt: true, depth });
+            const extra = coreChatItem.extra;
+            if (extra && typeof extra === 'object') {
+                // Pass an isolated extra clone: appendFileContent writes fileLength,
+                // and coreChat entries share extra by reference with the live chat.
+                processed = await helpers.appendFileContent({ extra: { ...extra } }, processed);
+                const titles = [];
+                if (extra.append_title && extra.title) titles.push(extra.title);
+                if (Array.isArray(extra.media)) {
+                    for (const mediaItem of extra.media) {
+                        if (mediaItem?.title && mediaItem?.append_title) titles.push(mediaItem.title);
+                    }
+                }
+                if (titles.length > 0) processed = `${processed}\n\n${titles.join('\n\n')}`;
+            }
+            return processed;
+        } catch (e) {
+            log('Failed to reprocess linked text; patching raw', e?.message);
+            return text;
+        }
+    }
+
     /**
      * Patch every historical user turn that sits before an assistant message parked
      * on a NON-latest swipe, replacing its outgoing text with that swipe's linked
@@ -1670,9 +1804,10 @@
      * Operates directly on the spread-copied coreChat entries (which carry
      * swipe_info/swipe_id/swipes), so no live-chat matching is needed. Only
      * non-latest swipes are touched — the latest swipe equals canonical by
-     * construction, and skipping it avoids clobbering regex-processed text.
+     * construction. The replacement text is re-run through SillyTavern's prompt
+     * preprocessing so it matches the surrounding entries.
      */
-    function patchHistoricalUserTurns(chat) {
+    async function patchHistoricalUserTurns(chat, interceptorType) {
         if (!Array.isArray(chat)) return;
         for (let i = 0; i < chat.length; i++) {
             const aiMsg = chat[i];
@@ -1688,8 +1823,10 @@
             }
             if (userIdx === -1) continue;
             const userMsg = chat[userIdx];
-            if (!userMsg || typeof userMsg !== 'object' || userMsg.mes === linked) continue;
-            userMsg.mes = linked;
+            if (!userMsg || typeof userMsg !== 'object') continue;
+            const processed = await reprocessUserTextForPrompt(chat, userMsg, linked, interceptorType);
+            if (userMsg.mes === processed) continue;
+            userMsg.mes = processed;
             log('Interceptor (normal) patched historical user idx', userIdx, 'for assistant idx', i, 'swipe', swipeId, 'to:', linked.substring(0, 60));
         }
     }
@@ -1697,7 +1834,7 @@
     exposeOwnedGlobal('swipeLinkedUserEditInterceptor', async function (chat, _contextSize, _abort, _type) {
         const interceptorType = normalizeGenerationEventType(_type);
         if (interceptorType === 'normal') {
-            patchHistoricalUserTurns(chat);
+            await patchHistoricalUserTurns(chat, interceptorType);
             return;
         }
         if (interceptorType !== 'swipe' && interceptorType !== 'regenerate' && interceptorType !== 'continue') return;
@@ -1818,14 +1955,18 @@
             return;
         }
 
+        // Re-run SillyTavern's prompt-time preprocessing (regex / file content /
+        // titles) on the replacement text so the swap doesn't drop it.
+        const processedText = await reprocessUserTextForPrompt(chat, msg, textToPatch, interceptorType);
+
         // If already matching, skip
-        if (msg.mes === textToPatch) return;
+        if (msg.mes === processedText) return;
 
         // coreChat contains spread-copied objects (SillyTavern's Generate builds coreChat
         // via chat.filter().map(item => ({ ...item, mes: regexed }))), so this mutation
         // only affects the API call. No restoration needed.
-        msg.mes = textToPatch;
-        log('Interceptor patched user msg idx', userIdx, 'with key', keyToUse, 'source', textSource, 'to:', textToPatch.substring(0, 60));
+        msg.mes = processedText;
+        log('Interceptor patched user msg idx', userIdx, 'with key', keyToUse, 'source', textSource, 'to:', processedText.substring(0, 60));
     });
 
     // ─── "View linked edits" Button ──────────────────────────────────────────────
