@@ -139,7 +139,16 @@
         if (!assistantMsg || !Number.isFinite(swipeId) || typeof userText !== 'string') return false;
 
         let wrote = false;
-        if (assistantMsg.swipe_info?.[swipeId]) {
+        // When a swipe_info array exists it is authoritative for reads
+        // (getLinkedUserText), so ensure the per-swipe entry exists and carries
+        // the text — otherwise the write would land only in msg.extra below and
+        // be ignored on read. Do NOT fabricate the array for a never-swiped
+        // message: that path is served by the msg.extra fallback and creating
+        // swipe_info early could disturb SillyTavern's own swipe bookkeeping.
+        if (Array.isArray(assistantMsg.swipe_info)) {
+            if (!assistantMsg.swipe_info[swipeId] || typeof assistantMsg.swipe_info[swipeId] !== 'object') {
+                assistantMsg.swipe_info[swipeId] = {};
+            }
             if (!assistantMsg.swipe_info[swipeId].extra || typeof assistantMsg.swipe_info[swipeId].extra !== 'object') {
                 assistantMsg.swipe_info[swipeId].extra = {};
             }
@@ -789,10 +798,23 @@
             }
         }
         let usedOverswipeKey = null;
-        if (normalizedType === 'swipe' && (!sourceKey || !hasLinkedTextByKey(sourceKey)) && pendingSwipeGenerationKey && hasLinkedTextByKey(pendingSwipeGenerationKey)) {
-            sourceKey = pendingSwipeGenerationKey;
-            usedOverswipeKey = pendingSwipeGenerationKey;
-            log('captureGenerationContext – using pre-overswipe key', sourceKey, 'at', capturedAt);
+        if (normalizedType === 'swipe' && pendingSwipeGenerationKey && hasLinkedTextByKey(pendingSwipeGenerationKey)) {
+            // The explicitly captured overswipe key must win whenever the current
+            // sourceKey is unusable OR points at a different assistant than the
+            // one that was swiped. This stops a stale-but-valid activeKey (e.g.
+            // still pointing at the latest assistant) from beating a prior
+            // message's swipe. Same-assistant precedence (e.g. a pending edit on
+            // the swiped message) is preserved by the original guard.
+            const sourceParsed = parseMappingKey(sourceKey);
+            const pendingParsed = parseMappingKey(pendingSwipeGenerationKey);
+            const differentAssistant = !sourceParsed || !pendingParsed
+                || sourceParsed.assistantMesId !== pendingParsed.assistantMesId;
+            if (!sourceKey || !hasLinkedTextByKey(sourceKey) || differentAssistant) {
+                sourceKey = pendingSwipeGenerationKey;
+                activeKey = pendingSwipeGenerationKey;
+                usedOverswipeKey = pendingSwipeGenerationKey;
+                log('captureGenerationContext – using pre-overswipe key', sourceKey, 'at', capturedAt);
+            }
         }
         pendingSwipeGenerationKey = null;
 
@@ -1113,6 +1135,11 @@
         pendingGenerationType = null;
         didReceiveMessageForGeneration = false;
         pendingSwipeGenerationKey = null;
+        // Drop any in-flight generation state. Without this, switching chats
+        // mid-generation leaves isGenerating stuck true, which suppresses later
+        // skipWhileGenerating renders; bumping the seq cancels delayed cleanups.
+        isGenerating = false;
+        generationSeq++;
         detachObserver();
         invalidateMesElCache();
         if (swipeDebounceTimer) {
@@ -1418,14 +1445,25 @@
             // which may point at a different (e.g. the latest) message.
             const sourceSwipeId = Math.max(0, aiMsg.swipes.length - 1);
             const sourceKey = `${assistantMesId}:${sourceSwipeId}`;
+
+            // Make the swiped assistant the active source immediately, so a
+            // generation that fires before the deferred render runs can't read a
+            // stale activeKey that points at a different message.
+            activeKey = sourceKey;
+
             if (hasLinkedTextByKey(sourceKey)) {
                 pendingSwipeGenerationKey = sourceKey;
                 log('MESSAGE_SWIPED – captured pre-overswipe key', pendingSwipeGenerationKey);
             } else if (!isGenerating) {
                 pendingSwipeGenerationKey = null;
             }
-        } else if (!isGenerating) {
-            pendingSwipeGenerationKey = null;
+        } else {
+            // Ordinary swipe between existing variants: sync activeKey to the
+            // swiped assistant's current swipe right away for the same reason.
+            activeKey = `${assistantMesId}:${resolveSwipeId(assistantMesId, aiMsg)}`;
+            if (!isGenerating) {
+                pendingSwipeGenerationKey = null;
+            }
         }
 
         scheduleSwipeRenderAfterFrame(assistantMesId);
