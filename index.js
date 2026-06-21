@@ -15,6 +15,21 @@
     const instanceToken = {};
     globalThis[INSTANCE_KEY] = instanceToken;
 
+    // Tag globals this instance owns with its instance token so teardown only
+    // removes the ones it created. Without this, a partial disable/reload could
+    // leave stale functions behind, or tear down a newer instance's globals.
+    function exposeOwnedGlobal(name, value) {
+        if (value != null) value[INSTANCE_KEY] = instanceToken;
+        globalThis[name] = value;
+        return value;
+    }
+
+    function deleteOwnedGlobal(name) {
+        if (globalThis[name]?.[INSTANCE_KEY] === instanceToken) {
+            delete globalThis[name];
+        }
+    }
+
     // ─── State ────────────────────────────────────────────────────────────────────
     let activeKey = null;
     let pendingUserText = null;
@@ -101,18 +116,21 @@
 
     function getLinkedUserText(assistantMsg, swipeId = null) {
         if (!assistantMsg) return null;
-        if (swipeId == null) {
-            const activeText = assistantMsg.extra?.linked_user_text;
-            return typeof activeText === 'string' ? activeText : null;
-        }
-        const swipeInfo = assistantMsg.swipe_info?.[swipeId];
-        const linkedText = swipeInfo?.extra?.linked_user_text;
-        if (typeof linkedText === 'string') return linkedText;
-        if (swipeInfo) return null;
 
         const activeSwipeId = typeof assistantMsg.swipe_id === 'number' ? assistantMsg.swipe_id : 0;
-        if (swipeId === activeSwipeId && typeof assistantMsg.extra?.linked_user_text === 'string') {
-            return assistantMsg.extra.linked_user_text;
+        if (swipeId == null) swipeId = activeSwipeId;
+
+        // Per-swipe metadata is authoritative.
+        const linkedText = assistantMsg.swipe_info?.[swipeId]?.extra?.linked_user_text;
+        if (typeof linkedText === 'string') return linkedText;
+
+        // Only fall back to the mirrored msg.extra value for a never-swiped
+        // message (no swipe_info array at all) and only for the active swipe.
+        // Once a swipe_info array exists it is the source of truth, so a leftover
+        // msg.extra value from a different swipe can't masquerade as this one's.
+        if (!Array.isArray(assistantMsg.swipe_info) && swipeId === activeSwipeId) {
+            const activeText = assistantMsg.extra?.linked_user_text;
+            return typeof activeText === 'string' ? activeText : null;
         }
         return null;
     }
@@ -265,7 +283,7 @@
         const mesId = Number(mesIdRaw);
         if (!Number.isFinite(mesId)) return;
 
-        const chatIndex = findChatIndexByEventId(mesId);
+        const chatIndex = findChatIndexByDomId(mesId);
         if (chatIndex == null) return;
         const msg = chat[chatIndex];
         if (!msg || !msg.is_user) return;
@@ -299,7 +317,7 @@
         return key;
     }
 
-    globalThis.swipeLinkedUserEditDebug = function () {
+    exposeOwnedGlobal('swipeLinkedUserEditDebug', function () {
         try {
             const ctx = globalThis.SillyTavern?.getContext?.();
             const chat = ctx?.chat;
@@ -327,7 +345,7 @@
         } catch (e) {
             console.warn(`[${EXTENSION_NAME}] debug error`, e);
         }
-    };
+    });
 
     // ─── DOM Selectors (resilient) ───────────────────────────────────────────────
 
@@ -376,9 +394,19 @@
         return ids;
     }
 
+    function findChatIndexByDomId(domId) {
+        // DOM-derived ids must resolve via the stable mesid mapping only.
+        // findChatIndexByMesId keeps a *guarded* array-index fallback for
+        // SillyTavern builds without stable ids, but never resolves a stale id
+        // onto a row that already carries a different stable id. Avoid the
+        // event-style fallback here, which would blindly treat any in-range
+        // number as an array index and could target the wrong message.
+        return findChatIndexByMesId(domId);
+    }
+
     function getChatIndexForMesEl(el) {
         for (const id of getMesIdsFromElement(el)) {
-            const chatIndex = findChatIndexByEventId(id);
+            const chatIndex = findChatIndexByDomId(id);
             if (chatIndex != null) return chatIndex;
         }
         return null;
@@ -1360,32 +1388,50 @@
 
     function onMessageSwiped(messageIndex) {
         messageIndex = normalizeMessageIndex(messageIndex);
-        const previousKey = activeKey;
         log('MESSAGE_SWIPED', messageIndex);
 
         // Synchronously detect overswipe BEFORE rAF, because Generate('swipe')
         // fires immediately after this emit resolves.
         const ctx = SillyTavern.getContext();
         const chat = ctx.chat;
-        const aiIdx = messageIndex != null ? findChatIndexByEventId(messageIndex) : getLastAssistantIndexFromChat();
+
+        // Resolve the assistant that was actually swiped. Do NOT fall back to the
+        // last assistant for an explicit swipe event — an unresolvable payload
+        // must be a no-op rather than silently act on the latest message (which
+        // is how a prior-message swipe could be mistaken for a latest-message one).
+        const aiIdx = messageIndex != null ? findChatIndexByEventId(messageIndex) : null;
         const aiMsg = aiIdx != null && chat ? chat[aiIdx] : null;
+        if (!aiMsg || aiMsg.is_user || aiMsg.is_system) {
+            log('MESSAGE_SWIPED – could not resolve swiped assistant; ignoring', messageIndex);
+            return;
+        }
+
+        const assistantMesId = getMesIdFromChatIndex(aiIdx);
         const isOverswipePending = Boolean(
-            aiMsg &&
             Array.isArray(aiMsg.swipes) &&
             typeof aiMsg.swipe_id === 'number' &&
             aiMsg.swipe_id >= aiMsg.swipes.length,
         );
-        if (isOverswipePending && previousKey && hasLinkedTextByKey(previousKey)) {
-            pendingSwipeGenerationKey = previousKey;
-            log('MESSAGE_SWIPED – captured pre-overswipe key', pendingSwipeGenerationKey);
+        if (isOverswipePending) {
+            // The overswipe generates from the last existing swipe of THIS
+            // assistant — not from whatever activeKey happens to be globally,
+            // which may point at a different (e.g. the latest) message.
+            const sourceSwipeId = Math.max(0, aiMsg.swipes.length - 1);
+            const sourceKey = `${assistantMesId}:${sourceSwipeId}`;
+            if (hasLinkedTextByKey(sourceKey)) {
+                pendingSwipeGenerationKey = sourceKey;
+                log('MESSAGE_SWIPED – captured pre-overswipe key', pendingSwipeGenerationKey);
+            } else if (!isGenerating) {
+                pendingSwipeGenerationKey = null;
+            }
         } else if (!isGenerating) {
             pendingSwipeGenerationKey = null;
         }
 
-        scheduleSwipeRenderAfterFrame(aiIdx != null ? getMesIdFromChatIndex(aiIdx) : null);
+        scheduleSwipeRenderAfterFrame(assistantMesId);
         // A fresh variant may have just crossed the "more than one swipe" threshold,
         // so (re)evaluate the edits button for this message.
-        ensureEditsButtonForAssistant(aiIdx != null ? getMesIdFromChatIndex(aiIdx) : null);
+        ensureEditsButtonForAssistant(assistantMesId);
     }
 
     function onMessageUpdated(messageIndex) {
@@ -1502,8 +1548,11 @@
 
     function onMessageSwipeDeleted(data) {
         if (!data || typeof data !== 'object') return;
-        const { messageId, swipeId } = data;
-        if (typeof messageId !== 'number' || typeof swipeId !== 'number') return;
+        const messageId = normalizeMessageIndex(
+            data.messageId ?? data.message_id ?? data.mesid ?? data.mesId ?? data.index,
+        );
+        const swipeId = Number(data.swipeId ?? data.swipe_id);
+        if (messageId == null || !Number.isFinite(swipeId)) return;
 
         let assistantIdx = findChatIndexByEventId(messageId);
         const assistantMesId = assistantIdx != null ? getMesIdFromChatIndex(assistantIdx) : messageId;
@@ -1607,7 +1656,7 @@
         }
     }
 
-    globalThis.swipeLinkedUserEditInterceptor = async function (chat, _contextSize, _abort, _type) {
+    exposeOwnedGlobal('swipeLinkedUserEditInterceptor', async function (chat, _contextSize, _abort, _type) {
         const interceptorType = normalizeGenerationEventType(_type);
         if (interceptorType === 'normal') {
             patchHistoricalUserTurns(chat);
@@ -1739,7 +1788,7 @@
         // only affects the API call. No restoration needed.
         msg.mes = textToPatch;
         log('Interceptor patched user msg idx', userIdx, 'with key', keyToUse, 'source', textSource, 'to:', textToPatch.substring(0, 60));
-    };
+    });
 
     // ─── "View linked edits" Button ──────────────────────────────────────────────
 
@@ -1987,16 +2036,16 @@
         hasMessageSwipedEvent = false;
         document.removeEventListener('click', onDocumentClick);
         document.removeEventListener('DOMContentLoaded', bootWithRuntimeBus);
-        if (globalThis.swipeLinkedUserEditTeardown === teardown) {
-            delete globalThis.swipeLinkedUserEditTeardown;
-        }
+        deleteOwnedGlobal('swipeLinkedUserEditInterceptor');
+        deleteOwnedGlobal('swipeLinkedUserEditDebug');
+        deleteOwnedGlobal('swipeLinkedUserEditTeardown');
         if (globalThis[INSTANCE_KEY] === instanceToken) {
             delete globalThis[INSTANCE_KEY];
         }
         log('Extension torn down');
     }
 
-    globalThis.swipeLinkedUserEditTeardown = teardown;
+    exposeOwnedGlobal('swipeLinkedUserEditTeardown', teardown);
 
     function init() {
         if (!isCurrentInstance()) return;

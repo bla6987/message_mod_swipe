@@ -12,12 +12,19 @@ This extension stores the user message text that was active for each AI swipe va
 
 ## Install
 
+> **Note on naming:** this repo is `message_mod_swipe`, but the extension's
+> internal namespace and settings key are `swipe_linked_user_edit`. The
+> installed folder name is arbitrary — SillyTavern reads `manifest.json`, not
+> the folder name — so the examples below use `message_mod_swipe` to match the
+> repo. You may rename the folder to `swipe_linked_user_edit` if you prefer; it
+> makes no functional difference.
+
 ### Per-user install
 
 Copy or symlink this folder into:
 
 ```
-data/<user-handle>/extensions/third-party/swipe_linked_user_edit/
+data/<user-handle>/extensions/third-party/message_mod_swipe/
 ```
 
 ### Global install (all users)
@@ -25,7 +32,7 @@ data/<user-handle>/extensions/third-party/swipe_linked_user_edit/
 Copy or symlink into:
 
 ```
-public/scripts/extensions/third-party/swipe_linked_user_edit/
+public/scripts/extensions/third-party/message_mod_swipe/
 ```
 
 Then enable the extension in **Extensions > Manage Extensions** within SillyTavern.
