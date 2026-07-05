@@ -54,6 +54,26 @@ history icon (⟲) in the message actions menu (the `…` button). Click it to o
 a popup listing the user text each swipe was generated from, grouping identical
 edits together and marking the swipe you're currently viewing.
 
+### Manually control what gets sent
+
+The same popup lets you override the linked text, so you can fix a typo or
+choose exactly which user text goes out with the next generation. Each group of
+swipes offers:
+
+- **Edit text… / Set text…** — edit the linked user text in place (e.g. correct
+  a spelling error). The corrected text is what those swipes send to the model.
+- **Use latest message text** — replace the group's linked text with the user
+  message's current (pencil-edited) text. Shown when the two differ.
+- **Unlink** — remove the linked text entirely, so those swipes always send the
+  latest message text.
+- **Send this for current swipe** — copy another group's text onto the swipe you
+  are currently viewing, making it the text sent in the current context.
+
+Manual overrides are marked "manually set" in the popup and are authoritative:
+unlike automatic links, they are honored on normal sends even when the message
+sits on its latest (or only) swipe. Regenerating a swipe replaces the override
+with a fresh automatic link.
+
 ## Debug Mode
 
 Open the browser console and run:
@@ -78,4 +98,5 @@ Debug logs are prefixed with `[swipe_linked_user_edit]`.
 3. Per-swipe persistence — generated variants store `linked_user_text` on `swipe_info[swipeId].extra`, with the active swipe mirrored to `msg.extra.linked_user_text` for SillyTavern's swipe sync.
 4. Swipe detection (SillyTavern's `MESSAGE_SWIPED` event, with DOM fallback) reads that per-swipe metadata and updates the displayed user bubble when a linked text exists.
 5. `generate_interceptor` — ephemerally patches `msg.mes` on the selected user message in the outgoing prompt array. Patch precedence is `edited > generation-start snapshot > linked swipe text` to avoid race-dependent stale prompts.
-6. `CHAT_CHANGED` — clears session-only lifecycle state. Persisted `swipe_info[].extra.linked_user_text` values remain in chat data and survive reloads, chat switches, and branching.
+6. Manual overrides — the "Linked user edits" popup writes `linked_user_text` alongside a `linked_user_text_manual` flag. Flagged links are honored by the normal-send patcher even on the latest/only swipe; automatic writes (generation completion) clear the flag.
+7. `CHAT_CHANGED` — clears session-only lifecycle state. Persisted `swipe_info[].extra.linked_user_text` values remain in chat data and survive reloads, chat switches, and branching.

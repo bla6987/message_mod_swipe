@@ -138,8 +138,20 @@
         return null;
     }
 
-    function setLinkedUserText(assistantMsg, swipeId, userText) {
+    function setLinkedUserText(assistantMsg, swipeId, userText, { manual = false } = {}) {
         if (!assistantMsg || !Number.isFinite(swipeId) || typeof userText !== 'string') return false;
+
+        // Manual (user-initiated) overrides are flagged so the normal-send patcher
+        // honors them even on the latest swipe, where automatic links are assumed
+        // to match the canonical text and are skipped. Automatic writes clear the
+        // flag because they replace whatever the user had pinned.
+        const applyFlag = (extraObj) => {
+            if (manual) {
+                extraObj.linked_user_text_manual = true;
+            } else {
+                delete extraObj.linked_user_text_manual;
+            }
+        };
 
         let wrote = false;
         // When a swipe_info array exists it is authoritative for reads
@@ -156,6 +168,7 @@
                 assistantMsg.swipe_info[swipeId].extra = {};
             }
             assistantMsg.swipe_info[swipeId].extra.linked_user_text = userText;
+            applyFlag(assistantMsg.swipe_info[swipeId].extra);
             wrote = true;
         }
 
@@ -165,10 +178,77 @@
                 assistantMsg.extra = {};
             }
             assistantMsg.extra.linked_user_text = userText;
+            applyFlag(assistantMsg.extra);
             wrote = true;
         }
 
         return wrote;
+    }
+
+    function isManualLinkedUserText(assistantMsg, swipeId) {
+        if (!assistantMsg) return false;
+        const activeSwipeId = typeof assistantMsg.swipe_id === 'number' ? assistantMsg.swipe_id : 0;
+        if (swipeId == null) swipeId = activeSwipeId;
+        // Mirror getLinkedUserText's read precedence: per-swipe metadata is
+        // authoritative; msg.extra only serves never-swiped messages.
+        const swipeExtra = Array.isArray(assistantMsg.swipe_info) ? assistantMsg.swipe_info[swipeId]?.extra : null;
+        if (swipeExtra && typeof swipeExtra.linked_user_text === 'string') {
+            return swipeExtra.linked_user_text_manual === true;
+        }
+        if (!Array.isArray(assistantMsg.swipe_info) && swipeId === activeSwipeId) {
+            return assistantMsg.extra?.linked_user_text_manual === true;
+        }
+        return false;
+    }
+
+    function deleteLinkedUserText(assistantMsg, swipeId) {
+        if (!assistantMsg || !Number.isFinite(swipeId)) return false;
+        let removed = false;
+        const swipeExtra = Array.isArray(assistantMsg.swipe_info) ? assistantMsg.swipe_info[swipeId]?.extra : null;
+        if (swipeExtra && typeof swipeExtra.linked_user_text === 'string') {
+            delete swipeExtra.linked_user_text;
+            delete swipeExtra.linked_user_text_manual;
+            removed = true;
+        }
+        const activeSwipeId = typeof assistantMsg.swipe_id === 'number' ? assistantMsg.swipe_id : 0;
+        if (swipeId === activeSwipeId && typeof assistantMsg.extra?.linked_user_text === 'string') {
+            delete assistantMsg.extra.linked_user_text;
+            delete assistantMsg.extra.linked_user_text_manual;
+            removed = true;
+        }
+        return removed;
+    }
+
+    /**
+     * User-initiated override of the linked text for a set of swipes on one
+     * assistant message. `text` is the new linked user text; `null` unlinks the
+     * swipes so they fall back to the canonical (latest-edited) message text.
+     * Stale session intents (pendingEditedEntry) for the affected keys are
+     * dropped so the manual choice is what the next generation actually uses.
+     */
+    function applyManualLinkedText(assistantMesId, swipeIds, text) {
+        const assistantMsg = resolveAssistantMsg(assistantMesId);
+        if (!assistantMsg || !Array.isArray(swipeIds)) return false;
+        let changed = false;
+        for (const swipeId of swipeIds) {
+            if (!Number.isFinite(swipeId)) continue;
+            if (typeof text === 'string') {
+                if (setLinkedUserText(assistantMsg, swipeId, text, { manual: true })) changed = true;
+            } else if (deleteLinkedUserText(assistantMsg, swipeId)) {
+                changed = true;
+            }
+            if (pendingEditedEntry?.key === `${assistantMesId}:${swipeId}`) {
+                pendingEditedEntry = null;
+            }
+        }
+        if (changed) {
+            requestChatSave();
+            ensureEditsButtonForAssistant(assistantMesId);
+            scheduleSwipeRenderAfterFrame(assistantMesId);
+            log('Manual linked-text override for assistant', assistantMesId, 'swipes', swipeIds,
+                text == null ? '(unlinked)' : `-> ${text.substring(0, 60)}`);
+        }
+        return changed;
     }
 
     function confirmLinkedUserText(assistantMesId, swipeId, userText) {
@@ -1814,7 +1894,12 @@
             if (!aiMsg || aiMsg.is_user || aiMsg.is_system) continue;
             const swipes = Array.isArray(aiMsg.swipes) ? aiMsg.swipes : null;
             const swipeId = getSwipeIdFromMsg(aiMsg);
-            if (!swipes || swipeId >= swipes.length - 1) continue;
+            // The latest swipe's automatic link equals the canonical text by
+            // construction, so patching it would only override later canonical
+            // edits with stale text. A manual (user-pinned) link is authoritative
+            // everywhere, including the latest or only swipe.
+            const isLatestOrOnlySwipe = !swipes || swipeId >= swipes.length - 1;
+            if (isLatestOrOnlySwipe && !isManualLinkedUserText(aiMsg, swipeId)) continue;
             const linked = getLinkedUserText(aiMsg, swipeId);
             if (typeof linked !== 'string') continue;
             let userIdx = -1;
@@ -2062,15 +2147,8 @@
         if (mesEl) ensureEditsButton(mesEl, chatIndex, msg);
     }
 
-    function showEditsPopup(mesEl) {
-        const ctx = SillyTavern.getContext();
-        const chat = ctx.chat;
-        const chatIndex = getChatIndexForMesEl(mesEl);
-        const msg = chatIndex != null && chat ? chat[chatIndex] : null;
-        if (!msg || msg.is_user || msg.is_system) return;
-
+    function computeSwipeEditGroups(msg) {
         const swipeCount = Array.isArray(msg.swipes) ? Math.max(1, msg.swipes.length) : 1;
-        const activeSwipe = getSwipeIdFromMsg(msg);
 
         // Group swipes by their linked user text so identical edits collapse into one
         // entry that lists the swipes it applies to. Preserve first-seen order.
@@ -2088,6 +2166,29 @@
             }
             group.swipes.push(i);
         }
+        return { groups, swipeCount };
+    }
+
+    function makePopupActionButton(label, title, onClick) {
+        const btn = document.createElement('div');
+        btn.className = 'menu_button swipe_edits_action';
+        btn.textContent = label;
+        btn.title = title;
+        btn.addEventListener('click', onClick);
+        return btn;
+    }
+
+    function showEditsPopup(mesEl) {
+        const ctx = SillyTavern.getContext();
+        const chat = ctx.chat;
+        const chatIndex = getChatIndexForMesEl(mesEl);
+        const msg = chatIndex != null && chat ? chat[chatIndex] : null;
+        if (!msg || msg.is_user || msg.is_system) return;
+
+        const assistantMesId = getMesIdFromChatIndex(chatIndex);
+        // The fallback popup path serializes to HTML, which drops listeners —
+        // only offer the manual controls when the live-DOM popup is available.
+        const interactive = typeof ctx.callGenericPopup === 'function' && Boolean(ctx.POPUP_TYPE);
 
         const container = document.createElement('div');
         container.className = 'swipe_edits_popup';
@@ -2104,52 +2205,131 @@
         sub.style.opacity = '0.7';
         sub.style.marginBottom = '12px';
         sub.style.fontSize = '0.9em';
-        sub.textContent = `${groups.length} distinct edit${groups.length === 1 ? '' : 's'} across ${swipeCount} swipe${swipeCount === 1 ? '' : 's'}. The user text below is what each AI swipe was generated from.`;
         container.appendChild(sub);
 
-        const userIndex = getUserIndexBefore(chatIndex);
-        const canonical = userIndex != null ? getUserDisplayText(chat[userIndex]) : null;
+        const groupsWrap = document.createElement('div');
+        container.appendChild(groupsWrap);
 
-        for (const group of groups) {
-            const block = document.createElement('div');
-            block.style.border = '1px solid var(--SmartThemeBorderColor, rgba(255,255,255,0.15))';
-            block.style.borderRadius = '8px';
-            block.style.padding = '8px 10px';
-            block.style.marginBottom = '10px';
+        const applyAndRerender = (swipeIds, text) => {
+            applyManualLinkedText(assistantMesId, swipeIds, text);
+            renderGroups();
+        };
 
-            const label = document.createElement('div');
-            label.style.fontSize = '0.85em';
-            label.style.opacity = '0.8';
-            label.style.marginBottom = '6px';
-            const swipeNums = group.swipes.map((s) => {
-                const oneBased = `#${s + 1}`;
-                return s === activeSwipe ? `${oneBased} (current)` : oneBased;
-            }).join(', ');
-            const tags = [];
-            if (group.swipes.includes(activeSwipe)) tags.push('current');
-            if (canonical != null && group.text != null && group.text.trim() === canonical.trim()) tags.push('matches latest message');
-            label.textContent = `Swipe ${swipeNums}${tags.length ? ' — ' + tags.join(', ') : ''}`;
-            block.appendChild(label);
+        const renderTextEditor = (body, actions, group, initialText) => {
+            const editor = document.createElement('textarea');
+            editor.className = 'text_pole swipe_edits_editor';
+            editor.value = initialText;
+            editor.rows = Math.min(8, Math.max(3, initialText.split('\n').length + 1));
+            body.replaceChildren(editor);
 
-            const body = document.createElement('div');
-            body.style.whiteSpace = 'pre-wrap';
-            body.style.wordBreak = 'break-word';
-            if (group.text == null) {
-                body.style.fontStyle = 'italic';
-                body.style.opacity = '0.6';
-                body.textContent = 'No recorded edit (uses the latest message text).';
-            } else if (group.text.trim() === '') {
-                body.style.fontStyle = 'italic';
-                body.style.opacity = '0.6';
-                body.textContent = '(empty)';
-            } else {
-                body.textContent = group.text;
+            const editorActions = document.createElement('div');
+            editorActions.className = 'swipe_edits_actions';
+            editorActions.appendChild(makePopupActionButton('Save', 'Save this text as the linked user text for these swipes', () => {
+                applyAndRerender(group.swipes, editor.value);
+            }));
+            editorActions.appendChild(makePopupActionButton('Cancel', 'Discard changes', () => renderGroups()));
+            actions.replaceChildren(editorActions);
+            editor.focus();
+        };
+
+        function renderGroups() {
+            const liveMsg = resolveAssistantMsg(assistantMesId);
+            if (!liveMsg) {
+                groupsWrap.replaceChildren();
+                sub.textContent = 'Message no longer exists.';
+                return;
             }
-            block.appendChild(body);
-            container.appendChild(block);
+            const { groups, swipeCount } = computeSwipeEditGroups(liveMsg);
+            const activeSwipe = getSwipeIdFromMsg(liveMsg);
+            const userIndex = getUserIndexBefore(findChatIndexByMesId(assistantMesId));
+            const canonical = userIndex != null ? getUserDisplayText(ctx.chat[userIndex]) : null;
+
+            sub.textContent = `${groups.length} distinct edit${groups.length === 1 ? '' : 's'} across ${swipeCount} swipe${swipeCount === 1 ? '' : 's'}. `
+                + 'The user text below is what each AI swipe was generated from'
+                + (interactive ? ' — and what is sent to the model while that swipe is selected. Use the buttons to change it.' : '.');
+
+            groupsWrap.replaceChildren();
+            for (const group of groups) {
+                const block = document.createElement('div');
+                block.style.border = '1px solid var(--SmartThemeBorderColor, rgba(255,255,255,0.15))';
+                block.style.borderRadius = '8px';
+                block.style.padding = '8px 10px';
+                block.style.marginBottom = '10px';
+
+                const label = document.createElement('div');
+                label.style.fontSize = '0.85em';
+                label.style.opacity = '0.8';
+                label.style.marginBottom = '6px';
+                const swipeNums = group.swipes.map((s) => {
+                    const oneBased = `#${s + 1}`;
+                    return s === activeSwipe ? `${oneBased} (current)` : oneBased;
+                }).join(', ');
+                const tags = [];
+                if (group.swipes.includes(activeSwipe)) tags.push('current');
+                if (canonical != null && group.text != null && group.text.trim() === canonical.trim()) tags.push('matches latest message');
+                if (group.swipes.some((s) => isManualLinkedUserText(liveMsg, s))) tags.push('manually set');
+                label.textContent = `Swipe ${swipeNums}${tags.length ? ' — ' + tags.join(', ') : ''}`;
+                block.appendChild(label);
+
+                const body = document.createElement('div');
+                body.style.whiteSpace = 'pre-wrap';
+                body.style.wordBreak = 'break-word';
+                if (group.text == null) {
+                    body.style.fontStyle = 'italic';
+                    body.style.opacity = '0.6';
+                    body.textContent = 'No recorded edit (uses the latest message text).';
+                } else if (group.text.trim() === '') {
+                    body.style.fontStyle = 'italic';
+                    body.style.opacity = '0.6';
+                    body.textContent = '(empty)';
+                } else {
+                    body.textContent = group.text;
+                }
+                block.appendChild(body);
+
+                if (interactive) {
+                    const actions = document.createElement('div');
+                    actions.className = 'swipe_edits_actions';
+
+                    actions.appendChild(makePopupActionButton(
+                        group.text == null ? 'Set text…' : 'Edit text…',
+                        'Manually set the user text sent to the model for these swipes (e.g. fix a typo)',
+                        () => renderTextEditor(body, actions, group, group.text ?? canonical ?? ''),
+                    ));
+
+                    if (group.text != null && canonical != null && group.text.trim() !== canonical.trim()) {
+                        actions.appendChild(makePopupActionButton(
+                            'Use latest message text',
+                            'Replace the linked text for these swipes with the user message’s current (edited) text',
+                            () => applyAndRerender(group.swipes, canonical),
+                        ));
+                    }
+
+                    if (group.text != null) {
+                        actions.appendChild(makePopupActionButton(
+                            'Unlink',
+                            'Remove the linked text so these swipes always send the latest message text',
+                            () => applyAndRerender(group.swipes, null),
+                        ));
+                    }
+
+                    if (group.text != null && !group.swipes.includes(activeSwipe)) {
+                        actions.appendChild(makePopupActionButton(
+                            'Send this for current swipe',
+                            'Make this text what the current swipe sends to the model',
+                            () => applyAndRerender([activeSwipe], group.text),
+                        ));
+                    }
+
+                    block.appendChild(actions);
+                }
+                groupsWrap.appendChild(block);
+            }
         }
 
-        if (typeof ctx.callGenericPopup === 'function' && ctx.POPUP_TYPE) {
+        renderGroups();
+
+        if (interactive) {
             ctx.callGenericPopup(container, ctx.POPUP_TYPE.DISPLAY, '', { wide: true });
         } else if (typeof ctx.callPopup === 'function') {
             ctx.callPopup(container.outerHTML, 'text');

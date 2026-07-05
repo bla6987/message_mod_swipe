@@ -3,3 +3,23 @@
     border-left: 2px solid rgba(100, 200, 255, 0.35);
     padding-left: 6px;
 }
+
+/* "Linked user edits" popup – manual override controls */
+.swipe_edits_popup .swipe_edits_actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 8px;
+}
+
+.swipe_edits_popup .swipe_edits_action {
+    font-size: 0.85em;
+    padding: 2px 8px;
+    margin: 0;
+}
+
+.swipe_edits_popup .swipe_edits_editor {
+    width: 100%;
+    box-sizing: border-box;
+    resize: vertical;
+}
