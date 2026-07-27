@@ -221,6 +221,7 @@ function createHarness(chat, messageElements = []) {
                 isGenerating,
                 generationContext,
                 pendingGenerationType,
+                generationWasStopped,
             }),
         };
     `;
@@ -407,6 +408,169 @@ test('post-command watchdog clears aborted state but preserves active generation
     activeHarness.document.body.dataset.generating = 'true';
     activeHarness.runTimers(30000);
     assert.equal(activeHarness.sandbox.__swipeLinkedUserEditTestHooks.getState().isGenerating, true);
+});
+
+test('manual stop before a normal response does not consume the pending edit', async () => {
+    const sourceAssistant = {
+        is_user: false,
+        mes: 'old reply',
+        send_date: 'assistant-1',
+        swipe_id: 0,
+        swipes: ['old reply', 'alternate'],
+        swipe_info: [
+            { extra: { linked_user_text: 'original' } },
+            { extra: { linked_user_text: 'alternate text' } },
+        ],
+        extra: { linked_user_text: 'original' },
+    };
+    const chat = [
+        { is_user: true, mes: 'original', send_date: 'user-1' },
+        sourceAssistant,
+    ];
+    const harness = createHarness(chat);
+    harness.runTimers();
+
+    chat[0].mes = 'pencil edit';
+    await harness.eventSource.emit(harness.eventTypes.MESSAGE_EDITED, 0);
+    chat.push({ is_user: true, mes: 'follow-up', send_date: 'user-2' });
+    await harness.eventSource.emit(harness.eventTypes.MESSAGE_SENT, 2);
+    await harness.eventSource.emit(harness.eventTypes.GENERATION_STARTED, 'normal', {}, false);
+    await harness.eventSource.emit(harness.eventTypes.GENERATION_AFTER_COMMANDS, 'normal', {}, false);
+
+    const placeholder = {
+        is_user: false,
+        mes: '...',
+        send_date: 'assistant-2',
+        swipe_id: 0,
+        swipes: ['...'],
+        swipe_info: [{ extra: {} }],
+        extra: {},
+    };
+    chat.push(placeholder);
+    harness.context.streamingProcessor = {
+        result: '',
+        timeToFirstToken: null,
+        isFinished: true,
+        isStopped: false,
+        abortController: { signal: { aborted: true } },
+    };
+    await harness.eventSource.emit(harness.eventTypes.GENERATION_ENDED);
+    await harness.eventSource.emit(harness.eventTypes.GENERATION_STOPPED);
+    await harness.eventSource.emit(harness.eventTypes.MESSAGE_RECEIVED, 3, 'normal');
+
+    const state = harness.sandbox.__swipeLinkedUserEditTestHooks.getState();
+    assert.equal(state.generationWasStopped, true);
+    assert.equal(state.pendingEditedEntry.text, 'pencil edit');
+    assert.equal(placeholder.swipe_info[0].extra.linked_user_text, undefined);
+});
+
+test('zero-token stopped continuation does not rewrite provenance', async () => {
+    const assistant = {
+        is_user: false,
+        mes: 'existing reply',
+        send_date: 'assistant-1',
+        swipe_id: 0,
+        swipes: ['existing reply'],
+        swipe_info: [{ extra: { linked_user_text: 'original' } }],
+        extra: { linked_user_text: 'original' },
+    };
+    const chat = [
+        { is_user: true, mes: 'original', send_date: 'user-1' },
+        assistant,
+    ];
+    const harness = createHarness(chat);
+    harness.runTimers();
+
+    chat[0].mes = 'pencil edit';
+    await harness.eventSource.emit(harness.eventTypes.MESSAGE_EDITED, 0);
+    await harness.eventSource.emit(harness.eventTypes.GENERATION_STARTED, 'continue', {}, false);
+    await harness.eventSource.emit(harness.eventTypes.GENERATION_AFTER_COMMANDS, 'continue', {}, false);
+    harness.context.streamingProcessor = {
+        result: '',
+        timeToFirstToken: null,
+        isFinished: true,
+        isStopped: false,
+        abortController: { signal: { aborted: true } },
+    };
+    await harness.eventSource.emit(harness.eventTypes.GENERATION_ENDED);
+    await harness.eventSource.emit(harness.eventTypes.GENERATION_STOPPED);
+    await harness.eventSource.emit(harness.eventTypes.MESSAGE_RECEIVED, 1, 'continue');
+
+    const state = harness.sandbox.__swipeLinkedUserEditTestHooks.getState();
+    assert.equal(state.pendingEditedEntry.text, 'pencil edit');
+    assert.equal(assistant.swipe_info[0].extra.linked_user_text, 'original');
+});
+
+test('stopped continuation with partial output still records provenance', async () => {
+    const assistant = {
+        is_user: false,
+        mes: 'existing reply plus partial output',
+        send_date: 'assistant-1',
+        swipe_id: 0,
+        swipes: ['existing reply plus partial output'],
+        swipe_info: [{ extra: { linked_user_text: 'original' } }],
+        extra: { linked_user_text: 'original' },
+    };
+    const chat = [
+        { is_user: true, mes: 'original', send_date: 'user-1' },
+        assistant,
+    ];
+    const harness = createHarness(chat);
+    harness.runTimers();
+
+    chat[0].mes = 'pencil edit';
+    await harness.eventSource.emit(harness.eventTypes.MESSAGE_EDITED, 0);
+    await harness.eventSource.emit(harness.eventTypes.GENERATION_STARTED, 'continue', {}, false);
+    await harness.eventSource.emit(harness.eventTypes.GENERATION_AFTER_COMMANDS, 'continue', {}, false);
+    harness.context.streamingProcessor = {
+        result: ' plus partial output',
+        timeToFirstToken: 25,
+        isFinished: true,
+        isStopped: false,
+        abortController: { signal: { aborted: true } },
+    };
+    await harness.eventSource.emit(harness.eventTypes.GENERATION_ENDED);
+    await harness.eventSource.emit(harness.eventTypes.GENERATION_STOPPED);
+    await harness.eventSource.emit(harness.eventTypes.MESSAGE_RECEIVED, 1, 'continue');
+
+    const state = harness.sandbox.__swipeLinkedUserEditTestHooks.getState();
+    assert.equal(state.pendingEditedEntry, null);
+    assert.equal(state.generationWasStopped, false);
+    assert.equal(assistant.swipe_info[0].extra.linked_user_text, 'pencil edit');
+});
+
+test('pre-token streaming error placeholder is not treated as a response', async () => {
+    const chat = [
+        { is_user: true, mes: 'user text', send_date: 'user-1' },
+    ];
+    const harness = createHarness(chat);
+    harness.runTimers();
+    await harness.eventSource.emit(harness.eventTypes.MESSAGE_SENT, 0);
+    await harness.eventSource.emit(harness.eventTypes.GENERATION_STARTED, 'normal', {}, false);
+    await harness.eventSource.emit(harness.eventTypes.GENERATION_AFTER_COMMANDS, 'normal', {}, false);
+
+    const placeholder = {
+        is_user: false,
+        mes: '...',
+        send_date: 'assistant-1',
+        swipe_id: 0,
+        swipes: ['...'],
+        swipe_info: [{ extra: {} }],
+        extra: {},
+    };
+    chat.push(placeholder);
+    harness.context.streamingProcessor = {
+        result: '',
+        timeToFirstToken: null,
+        isFinished: false,
+        isStopped: true,
+        abortController: { signal: { aborted: true } },
+    };
+    await harness.eventSource.emit(harness.eventTypes.GENERATION_ENDED);
+    await harness.eventSource.emit(harness.eventTypes.MESSAGE_RECEIVED, 1, 'normal');
+
+    assert.equal(placeholder.swipe_info[0].extra.linked_user_text, undefined);
+    assert.equal(harness.sandbox.__swipeLinkedUserEditTestHooks.getState().pendingGenerationType, 'normal');
 });
 
 test('older messages loaded later receive the linked-edits button', async () => {

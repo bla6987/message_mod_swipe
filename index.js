@@ -52,6 +52,8 @@
     const mesElCache = new Map(); // mesId -> Element cache for getMesElByIndex
     let lastMesElCache = { user: null, assistant: null }; // cached results for getLastMesEl
     let generationWatchdogTimer = null; // clears isGenerating if a started generation never progresses
+    let lateMessageCleanupTimer = null; // clears context preserved for post-END MESSAGE_RECEIVED ordering
+    let generationWasStopped = false; // explicit cancellation tombstone until the next generation starts
     const GENERATION_START_WATCHDOG_MS = 10000; // grace period before treating a stuck generation as aborted
     const GENERATION_AFTER_COMMANDS_WATCHDOG_MS = 30000; // covers later core aborts before generation UI activates
     let stPromptHelpers; // undefined = not tried, null = unavailable, object = SillyTavern prompt-processing fns
@@ -1286,6 +1288,11 @@
             clearTimeout(generationWatchdogTimer);
             generationWatchdogTimer = null;
         }
+        if (lateMessageCleanupTimer) {
+            clearTimeout(lateMessageCleanupTimer);
+            lateMessageCleanupTimer = null;
+        }
+        generationWasStopped = false;
         detachObserver();
         invalidateMesElCache();
         if (swipeDebounceTimer) {
@@ -1348,6 +1355,7 @@
         if (dryRun === true) return;
         if (!shouldTrackGenerationType(type)) return;
 
+        generationWasStopped = false;
         isGenerating = true;
         generationSeq++;
         generationType = normalizeGenerationEventType(type);
@@ -1375,6 +1383,11 @@
         if (dryRun === true) return;
         if (!shouldTrackGenerationType(type)) return;
 
+        generationWasStopped = false;
+        if (lateMessageCleanupTimer) {
+            clearTimeout(lateMessageCleanupTimer);
+            lateMessageCleanupTimer = null;
+        }
         isGenerating = true;
         generationSeq++;
         generationType = normalizeGenerationEventType(type) || generationType;
@@ -1478,6 +1491,28 @@
         const msg = chat[chatIndex];
         if (!msg || msg.is_user || msg.is_system) return;
 
+        const streamingProcessor = ctx.streamingProcessor;
+        const streamWasInterrupted = Boolean(
+            generationWasStopped
+            || streamingProcessor?.isStopped
+            || streamingProcessor?.abortController?.signal?.aborted
+        );
+        const streamProducedOutput = Boolean(
+            streamingProcessor
+            && (
+                streamingProcessor.timeToFirstToken != null
+                || (typeof streamingProcessor.result === 'string' && streamingProcessor.result.length > 0)
+            )
+        );
+        if (streamWasInterrupted && !streamProducedOutput) {
+            log('MESSAGE_RECEIVED – ignored zero-token stopped/failed generation', {
+                messageIndex,
+                effectiveType,
+                messageText: typeof msg.mes === 'string' ? msg.mes.substring(0, 20) : null,
+            });
+            return;
+        }
+
         const aiMes = msg.mes;
         if (!aiMes) return;
 
@@ -1551,6 +1586,7 @@
         generationKey = null;
         generationContext = null;
         pendingGenerationType = null;
+        generationWasStopped = false;
         requestChatSave();
         scheduleSwipeRenderAfterFrame(assistantMesId);
     }
@@ -1604,7 +1640,9 @@
         }
         if (preserveForLateMessage) {
             log('GENERATION_ENDED – preserving context for late MESSAGE_RECEIVED', pendingGenerationType, generationKey);
-            setTimeout(() => {
+            if (lateMessageCleanupTimer) clearTimeout(lateMessageCleanupTimer);
+            lateMessageCleanupTimer = setTimeout(() => {
+                lateMessageCleanupTimer = null;
                 if (generationSeq !== seqAtEnd || isGenerating || didReceiveMessageForGeneration) return;
                 pendingUserText = null;
                 generationKey = null;
@@ -1621,6 +1659,12 @@
         }
         generationType = null;
         didReceiveMessageForGeneration = false;
+    }
+
+    function onGenerationStopped() {
+        generationWasStopped = true;
+        onGenerationEnded();
+        log('GENERATION_STOPPED – retaining pending edit but rejecting zero-token receipts');
     }
 
     function onMessageSwiped(messageIndex) {
@@ -2518,7 +2562,7 @@
         }
         bindEvent(eventSource, event_types.CHARACTER_MESSAGE_RENDERED, onCharacterMessageRendered);
         bindEvent(eventSource, event_types.GENERATION_ENDED, onGenerationEnded);
-        bindEvent(eventSource, event_types.GENERATION_STOPPED, onGenerationEnded);
+        bindEvent(eventSource, event_types.GENERATION_STOPPED, onGenerationStopped);
         bindEvent(eventSource, event_types.MESSAGE_SENT, onMessageSent);
         hasMessageSwipedEvent = false;
         if (event_types.MESSAGE_SWIPED) {

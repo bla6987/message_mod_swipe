@@ -6,6 +6,6 @@
     "js": "index.js",
     "css": "style.css",
     "author": "Anonymous",
-    "version": "1.0.1",
+    "version": "1.0.2",
     "generate_interceptor": "swipeLinkedUserEditInterceptor"
 }
