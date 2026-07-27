@@ -1,4 +1,5 @@
 .ai-notes/
+node_modules/
 
 # >>> agent_rules.sh managed >>>
 # Managed from AGENTS.md — do not edit these directly

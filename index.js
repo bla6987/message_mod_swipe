@@ -53,6 +53,7 @@
     let lastMesElCache = { user: null, assistant: null }; // cached results for getLastMesEl
     let generationWatchdogTimer = null; // clears isGenerating if a started generation never progresses
     const GENERATION_START_WATCHDOG_MS = 10000; // grace period before treating a stuck generation as aborted
+    const GENERATION_AFTER_COMMANDS_WATCHDOG_MS = 30000; // covers later core aborts before generation UI activates
     let stPromptHelpers; // undefined = not tried, null = unavailable, object = SillyTavern prompt-processing fns
     let chatLookupCache = null; // O(1) mesid -> chat index cache for the active chat
     const eventSubscriptions = [];
@@ -1049,6 +1050,32 @@
 
     function updateUserBubbleForActiveKey() {
         if (!activeKey) return;
+
+        // A pencil edit is the user's newest intent for this exact swipe until a
+        // generation successfully consumes it. Do not immediately replace the
+        // freshly edited bubble with the older persisted link; doing so would show
+        // one value while a normal send uses another.
+        if (pendingEditedEntry?.key === activeKey && typeof pendingEditedEntry.text === 'string') {
+            clearUserBubbleHighlightForActiveKey();
+            return;
+        }
+
+        // Automatic links on the latest swipe are deliberately not authoritative
+        // for normal sends: the user may have pencil-edited the canonical message
+        // after that response was generated. Keep the same policy in the UI so a
+        // reload cannot show the old automatic link while the prompt sends the
+        // canonical edit. Manual overrides remain authoritative everywhere.
+        const parsedActive = parseMappingKey(activeKey);
+        const activeAssistant = parsedActive ? resolveAssistantMsg(parsedActive.assistantMesId) : null;
+        if (activeAssistant && parsedActive) {
+            const swipes = Array.isArray(activeAssistant.swipes) ? activeAssistant.swipes : null;
+            const isLatestOrOnlySwipe = !swipes || parsedActive.swipeId >= swipes.length - 1;
+            if (isLatestOrOnlySwipe && !isManualLinkedUserText(activeAssistant, parsedActive.swipeId)) {
+                clearUserBubbleHighlightForActiveKey();
+                return;
+            }
+        }
+
         const userText = getLinkedTextByKey(activeKey);
         if (userText == null) {
             clearUserBubbleHighlightForActiveKey();
@@ -1341,6 +1368,7 @@
         pendingSwipeGenerationKey = null;
 
         log('GENERATION_AFTER_COMMANDS – pending:', pendingUserText && pendingUserText.substring(0, 60), 'key:', generationKey, 'ctx:', generationContext);
+        scheduleGenerationAfterCommandsWatchdog();
     }
 
     function onGenerationStarted(type, _generateOptions, dryRun) {
@@ -1384,6 +1412,40 @@
                 log('GENERATION_STARTED watchdog – generation never progressed; cleared stuck isGenerating');
             }
         }, GENERATION_START_WATCHDOG_MS);
+    }
+
+    function hasActiveGenerationUi() {
+        if (document.body?.dataset?.generating === 'true') return true;
+        const processor = globalThis.SillyTavern?.getContext?.()?.streamingProcessor;
+        return Boolean(processor && processor.isFinished !== true);
+    }
+
+    // SillyTavern also has early-return paths after GENERATION_AFTER_COMMANDS
+    // (unsupported streaming, Horde rejection, failed ping, no backend). Those
+    // call unblockGeneration without emitting GENERATION_ENDED/STOPPED. The start
+    // watchdog is deliberately invalidated once AFTER_COMMANDS fires, so arm a
+    // second, longer watchdog for this phase. A real request has activated
+    // SillyTavern's generation UI by then and must not be cleared.
+    function scheduleGenerationAfterCommandsWatchdog() {
+        if (generationWatchdogTimer) clearTimeout(generationWatchdogTimer);
+        const seqAtSchedule = generationSeq;
+        generationWatchdogTimer = setTimeout(() => {
+            generationWatchdogTimer = null;
+            if (generationSeq !== seqAtSchedule || !isGenerating) return;
+            if (hasActiveGenerationUi()) {
+                log('GENERATION_AFTER_COMMANDS watchdog – generation UI still active; leaving state intact');
+                return;
+            }
+            isGenerating = false;
+            pendingUserText = null;
+            generationKey = null;
+            generationContext = null;
+            generationType = null;
+            pendingGenerationType = null;
+            pendingSwipeGenerationKey = null;
+            didReceiveMessageForGeneration = false;
+            log('GENERATION_AFTER_COMMANDS watchdog – cleared aborted generation state');
+        }, GENERATION_AFTER_COMMANDS_WATCHDOG_MS);
     }
 
     function onMessageReceived(messageIndex, messageType) {
@@ -1479,6 +1541,7 @@
         backfillBatchSwipeMappings(msg, assistantMesId, swipeId, userTextForMapping);
         if (effectiveType === 'normal') {
             pendingNormalUserText = null;
+            pendingEditedEntry = null;
         } else {
             if (pendingEditedEntry && keyUsedForGeneration && pendingEditedEntry.key === keyUsedForGeneration) {
                 pendingEditedEntry = null;
@@ -1521,6 +1584,10 @@
     }
 
     function onGenerationEnded() {
+        if (generationWatchdogTimer) {
+            clearTimeout(generationWatchdogTimer);
+            generationWatchdogTimer = null;
+        }
         const preserveForLateMessage = !didReceiveMessageForGeneration && shouldTrackGenerationType(pendingGenerationType);
         const seqAtEnd = generationSeq;
         const overswipeKeyToRestore = !didReceiveMessageForGeneration ? generationContext?._usedOverswipeKey : null;
@@ -1787,7 +1854,6 @@
             sentUserText = getLastUserMesFromChat() || getLastUserMesFromDom();
         }
         pendingNormalUserText = typeof sentUserText === 'string' ? sentUserText : null;
-        pendingEditedEntry = null;
         activeKey = null;
         clearAnySwipeLinkedHighlight();
         log('MESSAGE_SENT – pending normal text:', pendingNormalUserText && pendingNormalUserText.substring(0, 60));
@@ -1894,13 +1960,26 @@
             if (!aiMsg || aiMsg.is_user || aiMsg.is_system) continue;
             const swipes = Array.isArray(aiMsg.swipes) ? aiMsg.swipes : null;
             const swipeId = getSwipeIdFromMsg(aiMsg);
+            const pendingParsed = parseMappingKey(pendingEditedEntry?.key);
+            const coreMesId = aiMsg.mesid ?? aiMsg.mesId ?? aiMsg.message_id;
+            const pendingAssistant = pendingParsed ? resolveAssistantMsg(pendingParsed.assistantMesId) : null;
+            const isPendingEditedSwipe = Boolean(
+                pendingParsed
+                && pendingParsed.swipeId === swipeId
+                && (
+                    coreMesId === pendingParsed.assistantMesId
+                    || (typeof coreMesId === 'string' && coreMesId === String(pendingParsed.assistantMesId))
+                    || (pendingAssistant && aiMsg.send_date != null && aiMsg.send_date === pendingAssistant.send_date)
+                )
+                && typeof pendingEditedEntry.text === 'string'
+            );
             // The latest swipe's automatic link equals the canonical text by
             // construction, so patching it would only override later canonical
             // edits with stale text. A manual (user-pinned) link is authoritative
             // everywhere, including the latest or only swipe.
             const isLatestOrOnlySwipe = !swipes || swipeId >= swipes.length - 1;
-            if (isLatestOrOnlySwipe && !isManualLinkedUserText(aiMsg, swipeId)) continue;
-            const linked = getLinkedUserText(aiMsg, swipeId);
+            if (!isPendingEditedSwipe && isLatestOrOnlySwipe && !isManualLinkedUserText(aiMsg, swipeId)) continue;
+            const linked = isPendingEditedSwipe ? pendingEditedEntry.text : getLinkedUserText(aiMsg, swipeId);
             if (typeof linked !== 'string') continue;
             let userIdx = -1;
             for (let j = i - 1; j >= 0; j--) {
@@ -2137,6 +2216,11 @@
 
             processChunk();
         });
+    }
+
+    function onMoreMessagesLoaded() {
+        invalidateMesElCache();
+        scheduleEditsButtonsForLoadedChat();
     }
 
     function ensureEditsButtonForAssistant(assistantIndexOrMesId) {
@@ -2446,6 +2530,9 @@
         }
         if (event_types.MESSAGE_SWIPE_DELETED) {
             bindEvent(eventSource, event_types.MESSAGE_SWIPE_DELETED, onMessageSwipeDeleted);
+        }
+        if (event_types.MORE_MESSAGES_LOADED) {
+            bindEvent(eventSource, event_types.MORE_MESSAGES_LOADED, onMoreMessagesLoaded);
         }
 
         // Delegated click handler for swipe buttons

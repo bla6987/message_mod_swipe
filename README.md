@@ -46,6 +46,9 @@ Then enable the extension in **Extensions > Manage Extensions** within SillyTave
 5. When you send the next message, the prompt context includes the correct user text for the currently displayed AI variant.
 
 It works transparently with the existing swipe arrows and hotkeys — no config UI.
+If you pencil-edit the message again after generating the latest swipe, that
+new canonical edit remains displayed and is used on the next normal send until
+you regenerate. Earlier selected swipes continue to use their linked text.
 
 ### View linked edits
 
@@ -83,6 +86,14 @@ SillyTavern.getContext().extensionSettings.swipe_linked_user_edit.debug = true;
 ```
 
 Debug logs are prefixed with `[swipe_linked_user_edit]`.
+
+## Testing
+
+Run the focused lifecycle regression suite with Node.js:
+
+```sh
+npm test
+```
 
 ## Known Limitations
 
