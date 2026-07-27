@@ -217,7 +217,9 @@ function createHarness(chat, messageElements = []) {
         globalThis.__swipeLinkedUserEditTestHooks = {
             getState: () => ({
                 activeKey,
-                pendingEditedEntry,
+                pendingEditedEntry: Array.from(pendingEditedEntries.values()).at(-1) ?? null,
+                pendingEditedEntries: Array.from(pendingEditedEntries.values()),
+                pendingEditKeysUsedForGeneration: Array.from(pendingEditKeysUsedForGeneration),
                 isGenerating,
                 generationContext,
                 pendingGenerationType,
@@ -364,6 +366,8 @@ test('normal prompt assembly honors a pending edit on a non-latest swipe', async
     await harness.eventSource.emit(harness.eventTypes.MESSAGE_EDITED, 0);
     chat.push({ is_user: true, mes: 'follow-up', send_date: 'user-2' });
     await harness.eventSource.emit(harness.eventTypes.MESSAGE_SENT, 2);
+    await harness.eventSource.emit(harness.eventTypes.GENERATION_STARTED, 'normal', {}, false);
+    await harness.eventSource.emit(harness.eventTypes.GENERATION_AFTER_COMMANDS, 'normal', {}, false);
 
     const coreChat = [
         { ...chat[0], index: 0 },
@@ -386,9 +390,166 @@ test('normal prompt assembly honors a pending edit on a non-latest swipe', async
         swipe_info: [{ extra: {} }],
         extra: {},
     });
+    await harness.eventSource.emit(harness.eventTypes.MESSAGE_RECEIVED, 3, 'normal');
+    await harness.eventSource.emit(harness.eventTypes.GENERATION_ENDED);
+    assert.equal(harness.sandbox.__swipeLinkedUserEditTestHooks.getState().pendingEditedEntry, null);
+});
+
+test('reload regenerate uses canonical text instead of a stale latest automatic link', async () => {
+    const assistant = {
+        is_user: false,
+        mes: 'reply B',
+        send_date: 'assistant-1',
+        swipe_id: 1,
+        swipes: ['reply A', 'reply B'],
+        swipe_info: [
+            { extra: { linked_user_text: 'older text' } },
+            { extra: { linked_user_text: 'pre-reload text' } },
+        ],
+        extra: { linked_user_text: 'pre-reload text' },
+    };
+    const chat = [
+        { is_user: true, mes: 'canonical edit after response', send_date: 'user-1' },
+        assistant,
+    ];
+    const harness = createHarness(chat);
+    harness.runTimers();
+
+    await harness.eventSource.emit(harness.eventTypes.GENERATION_STARTED, 'regenerate', {}, false);
+    await harness.eventSource.emit(harness.eventTypes.GENERATION_AFTER_COMMANDS, 'regenerate', {}, false);
+
+    const coreChat = [{ ...chat[0], index: 0 }];
+    await harness.sandbox.swipeLinkedUserEditInterceptor(coreChat, 4096, () => {}, 'regenerate');
+
+    assert.equal(coreChat[0].mes, 'canonical edit after response');
+    assert.equal(
+        harness.sandbox.__swipeLinkedUserEditTestHooks.getState().generationContext.sourceUserText,
+        'canonical edit after response',
+    );
+});
+
+test('multiple historical pencil edits are all applied to one normal prompt', async () => {
+    const firstAssistant = {
+        is_user: false,
+        mes: 'first reply A',
+        send_date: 'assistant-1',
+        swipe_id: 0,
+        swipes: ['first reply A', 'first reply B'],
+        swipe_info: [
+            { extra: { linked_user_text: 'first original' } },
+            { extra: { linked_user_text: 'first other' } },
+        ],
+        extra: { linked_user_text: 'first original' },
+    };
+    const secondAssistant = {
+        is_user: false,
+        mes: 'second reply A',
+        send_date: 'assistant-2',
+        swipe_id: 0,
+        swipes: ['second reply A', 'second reply B'],
+        swipe_info: [
+            { extra: { linked_user_text: 'second original' } },
+            { extra: { linked_user_text: 'second other' } },
+        ],
+        extra: { linked_user_text: 'second original' },
+    };
+    const chat = [
+        { is_user: true, mes: 'first original', send_date: 'user-1' },
+        firstAssistant,
+        { is_user: true, mes: 'second original', send_date: 'user-2' },
+        secondAssistant,
+    ];
+    const harness = createHarness(chat);
+    harness.runTimers();
+
+    chat[0].mes = 'first pencil edit';
+    await harness.eventSource.emit(harness.eventTypes.MESSAGE_EDITED, 0);
+    chat[2].mes = 'second pencil edit';
+    await harness.eventSource.emit(harness.eventTypes.MESSAGE_EDITED, 2);
+
+    chat.push({ is_user: true, mes: 'follow-up', send_date: 'user-3' });
+    await harness.eventSource.emit(harness.eventTypes.MESSAGE_SENT, 4);
     await harness.eventSource.emit(harness.eventTypes.GENERATION_STARTED, 'normal', {}, false);
     await harness.eventSource.emit(harness.eventTypes.GENERATION_AFTER_COMMANDS, 'normal', {}, false);
+
+    const coreChat = chat.map((message, index) => ({ ...message, index }));
+    await harness.sandbox.swipeLinkedUserEditInterceptor(coreChat, 4096, () => {}, 'normal');
+
+    assert.equal(coreChat[0].mes, 'first pencil edit');
+    assert.equal(coreChat[2].mes, 'second pencil edit');
+    assert.equal(
+        harness.sandbox.__swipeLinkedUserEditTestHooks.getState().pendingEditedEntries.map((entry) => entry.key).join(','),
+        '1:0,3:0',
+    );
+});
+
+test('pending historical edit survives an intermediary tool response and recursive generation', async () => {
+    const sourceAssistant = {
+        is_user: false,
+        mes: 'old reply A',
+        send_date: 'assistant-1',
+        swipe_id: 0,
+        swipes: ['old reply A', 'old reply B'],
+        swipe_info: [
+            { extra: { linked_user_text: 'original' } },
+            { extra: { linked_user_text: 'other' } },
+        ],
+        extra: { linked_user_text: 'original' },
+    };
+    const chat = [
+        { is_user: true, mes: 'original', send_date: 'user-1' },
+        sourceAssistant,
+    ];
+    const harness = createHarness(chat);
+    harness.runTimers();
+
+    chat[0].mes = 'pencil edit';
+    await harness.eventSource.emit(harness.eventTypes.MESSAGE_EDITED, 0);
+    chat.push({ is_user: true, mes: 'follow-up', send_date: 'user-2' });
+    await harness.eventSource.emit(harness.eventTypes.MESSAGE_SENT, 2);
+    await harness.eventSource.emit(harness.eventTypes.GENERATION_STARTED, 'normal', {}, false);
+    await harness.eventSource.emit(harness.eventTypes.GENERATION_AFTER_COMMANDS, 'normal', {}, false);
+
+    const firstCoreChat = chat.map((message, index) => ({ ...message, index }));
+    await harness.sandbox.swipeLinkedUserEditInterceptor(firstCoreChat, 4096, () => {}, 'normal');
+    assert.equal(firstCoreChat[0].mes, 'pencil edit');
+
+    chat.push({
+        is_user: false,
+        mes: 'I will call a tool.',
+        send_date: 'assistant-tool',
+        swipe_id: 0,
+        swipes: ['I will call a tool.'],
+        swipe_info: [{ extra: {} }],
+        extra: { tool_invocations: [{ id: 'tool-1' }] },
+    });
     await harness.eventSource.emit(harness.eventTypes.MESSAGE_RECEIVED, 3, 'normal');
+    assert.equal(
+        harness.sandbox.__swipeLinkedUserEditTestHooks.getState().pendingEditedEntry.text,
+        'pencil edit',
+    );
+
+    await harness.eventSource.emit(harness.eventTypes.GENERATION_STARTED, 'normal', {}, false);
+    await harness.eventSource.emit(harness.eventTypes.GENERATION_AFTER_COMMANDS, 'normal', {}, false);
+    const recursiveCoreChat = chat.map((message, index) => ({ ...message, index }));
+    await harness.sandbox.swipeLinkedUserEditInterceptor(recursiveCoreChat, 4096, () => {}, 'normal');
+    assert.equal(recursiveCoreChat[0].mes, 'pencil edit');
+
+    chat.push({
+        is_user: false,
+        mes: 'Final answer.',
+        send_date: 'assistant-final',
+        swipe_id: 0,
+        swipes: ['Final answer.'],
+        swipe_info: [{ extra: {} }],
+        extra: {},
+    });
+    await harness.eventSource.emit(harness.eventTypes.MESSAGE_RECEIVED, 4, 'normal');
+    assert.equal(
+        harness.sandbox.__swipeLinkedUserEditTestHooks.getState().pendingEditedEntry.text,
+        'pencil edit',
+    );
+    await harness.eventSource.emit(harness.eventTypes.GENERATION_ENDED);
     assert.equal(harness.sandbox.__swipeLinkedUserEditTestHooks.getState().pendingEditedEntry, null);
 });
 
@@ -436,6 +597,8 @@ test('manual stop before a normal response does not consume the pending edit', a
     await harness.eventSource.emit(harness.eventTypes.MESSAGE_SENT, 2);
     await harness.eventSource.emit(harness.eventTypes.GENERATION_STARTED, 'normal', {}, false);
     await harness.eventSource.emit(harness.eventTypes.GENERATION_AFTER_COMMANDS, 'normal', {}, false);
+    const stoppedNormalCoreChat = chat.map((message, index) => ({ ...message, index }));
+    await harness.sandbox.swipeLinkedUserEditInterceptor(stoppedNormalCoreChat, 4096, () => {}, 'normal');
 
     const placeholder = {
         is_user: false,
@@ -485,6 +648,8 @@ test('zero-token stopped continuation does not rewrite provenance', async () => 
     await harness.eventSource.emit(harness.eventTypes.MESSAGE_EDITED, 0);
     await harness.eventSource.emit(harness.eventTypes.GENERATION_STARTED, 'continue', {}, false);
     await harness.eventSource.emit(harness.eventTypes.GENERATION_AFTER_COMMANDS, 'continue', {}, false);
+    const stoppedContinueCoreChat = chat.map((message, index) => ({ ...message, index }));
+    await harness.sandbox.swipeLinkedUserEditInterceptor(stoppedContinueCoreChat, 4096, () => {}, 'continue');
     harness.context.streamingProcessor = {
         result: '',
         timeToFirstToken: null,
@@ -522,6 +687,8 @@ test('stopped continuation with partial output still records provenance', async 
     await harness.eventSource.emit(harness.eventTypes.MESSAGE_EDITED, 0);
     await harness.eventSource.emit(harness.eventTypes.GENERATION_STARTED, 'continue', {}, false);
     await harness.eventSource.emit(harness.eventTypes.GENERATION_AFTER_COMMANDS, 'continue', {}, false);
+    const partialContinueCoreChat = chat.map((message, index) => ({ ...message, index }));
+    await harness.sandbox.swipeLinkedUserEditInterceptor(partialContinueCoreChat, 4096, () => {}, 'continue');
     harness.context.streamingProcessor = {
         result: ' plus partial output',
         timeToFirstToken: 25,

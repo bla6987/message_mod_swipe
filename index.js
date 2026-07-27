@@ -44,7 +44,9 @@
     let pendingSwipeGenerationKey = null; // Previous swipe key captured before overswipe generation
     let pendingGenerationType = null; // Preserved across GENERATION_ENDED for late MESSAGE_RECEIVED
     let pendingNormalUserText = null; // Snapshot from MESSAGE_SENT used for normal-send mapping
-    let pendingEditedEntry = null; // { key, text } bound to the swipe key where latest-user edit occurred
+    const pendingEditedEntries = new Map(); // key -> { key, text }, one unconsumed pencil edit per swipe
+    const pendingEditKeysUsedForGeneration = new Set(); // retained across recursive tool-generation calls
+    let pendingEditCleanupRequested = false; // successful receipt seen; clear used edits when the chain finishes
     let generationContext = null; // { type, sourceKey, sourceAssistantMesId, sourceUserText, capturedAt }
     let generationSeq = 0; // Guards delayed cleanup from previous generation lifecycles
     let swipeRenderSeq = 0; // Guards delayed swipe DOM updates from older events
@@ -108,6 +110,46 @@
         const m = /^([0-9]+):([0-9]+)$/.exec(key);
         if (!m) return null;
         return { assistantMesId: Number(m[1]), swipeId: Number(m[2]) };
+    }
+
+    function getPendingEditedEntry(key) {
+        if (typeof key !== 'string') return null;
+        const entry = pendingEditedEntries.get(key);
+        return entry && typeof entry.text === 'string' ? entry : null;
+    }
+
+    function setPendingEditedEntry(key, text) {
+        if (typeof key !== 'string' || typeof text !== 'string') return null;
+        // Refresh insertion order so same-assistant fallback uses the newest edit.
+        pendingEditedEntries.delete(key);
+        const entry = { key, text };
+        pendingEditedEntries.set(key, entry);
+        return entry;
+    }
+
+    function deletePendingEditedEntry(key) {
+        if (typeof key !== 'string') return false;
+        pendingEditKeysUsedForGeneration.delete(key);
+        return pendingEditedEntries.delete(key);
+    }
+
+    function markPendingEditUsed(key) {
+        if (getPendingEditedEntry(key)) {
+            pendingEditKeysUsedForGeneration.add(key);
+        }
+    }
+
+    function clearConsumedPendingEdits() {
+        for (const key of pendingEditKeysUsedForGeneration) {
+            pendingEditedEntries.delete(key);
+        }
+        pendingEditKeysUsedForGeneration.clear();
+        pendingEditCleanupRequested = false;
+    }
+
+    function abandonPendingEditCleanup() {
+        pendingEditKeysUsedForGeneration.clear();
+        pendingEditCleanupRequested = false;
     }
 
     function resolveAssistantMsg(mesIdOrIdx) {
@@ -226,7 +268,7 @@
      * User-initiated override of the linked text for a set of swipes on one
      * assistant message. `text` is the new linked user text; `null` unlinks the
      * swipes so they fall back to the canonical (latest-edited) message text.
-     * Stale session intents (pendingEditedEntry) for the affected keys are
+     * Stale session intents (pendingEditedEntries) for the affected keys are
      * dropped so the manual choice is what the next generation actually uses.
      */
     function applyManualLinkedText(assistantMesId, swipeIds, text) {
@@ -240,9 +282,7 @@
             } else if (deleteLinkedUserText(assistantMsg, swipeId)) {
                 changed = true;
             }
-            if (pendingEditedEntry?.key === `${assistantMesId}:${swipeId}`) {
-                pendingEditedEntry = null;
-            }
+            deletePendingEditedEntry(`${assistantMesId}:${swipeId}`);
         }
         if (changed) {
             requestChatSave();
@@ -453,7 +493,7 @@
                 isGenerating,
                 pendingUserText,
                 pendingNormalUserText,
-                pendingEditedEntry,
+                pendingEditedEntries: Array.from(pendingEditedEntries.values()),
                 generationContext,
                 activeKey,
                 linkedUserText: activeKey ? getLinkedTextByKey(activeKey) : null,
@@ -830,6 +870,37 @@
         return getUserMesForAssistantMesId(parsed.assistantMesId);
     }
 
+    /**
+     * Resolve the text that should be used when generating from a selected swipe.
+     * A pending pencil edit wins. For the latest automatic swipe, canonical chat
+     * text wins over persisted metadata because the session-only edit marker may
+     * have been lost to a reload. Older swipes and manual overrides remain linked.
+     */
+    function getPreferredUserTextForKey(key) {
+        const pending = getPendingEditedEntry(key);
+        if (pending) return { text: pending.text, source: 'edited' };
+
+        const parsed = parseMappingKey(key);
+        const assistantMsg = parsed ? resolveAssistantMsg(parsed.assistantMesId) : null;
+        if (assistantMsg && parsed) {
+            const swipes = Array.isArray(assistantMsg.swipes) ? assistantMsg.swipes : null;
+            const isLatestOrOnlySwipe = !swipes || parsed.swipeId >= swipes.length - 1;
+            if (isLatestOrOnlySwipe && !isManualLinkedUserText(assistantMsg, parsed.swipeId)) {
+                const canonicalText = getUserMesForKey(key);
+                if (typeof canonicalText === 'string') {
+                    return { text: canonicalText, source: 'canonical' };
+                }
+            }
+        }
+
+        const mappedText = getLinkedTextByKey(key);
+        if (typeof mappedText === 'string') return { text: mappedText, source: 'mapped' };
+
+        const canonicalText = getUserMesForKey(key);
+        if (typeof canonicalText === 'string') return { text: canonicalText, source: 'canonical' };
+        return { text: null, source: null };
+    }
+
     function isSwipeLikeType(type) {
         return type === 'swipe' || type === 'regenerate' || type === 'continue';
     }
@@ -905,14 +976,26 @@
         const refreshHint = parseMappingKey(activeKey)?.assistantMesId ?? generationContext?.sourceAssistantMesId ?? null;
         refreshActiveKeyFromChat(refreshHint);
         let sourceKey = activeKey;
-        if (pendingEditedEntry?.key) {
-            const pendingParsed = parseMappingKey(pendingEditedEntry.key);
-            const activeParsed = parseMappingKey(activeKey);
-            if (pendingParsed && activeParsed && pendingParsed.assistantMesId === activeParsed.assistantMesId) {
-                sourceKey = pendingEditedEntry.key;
-            } else if (!pendingParsed || !doesAssistantExistForMesId(pendingParsed.assistantMesId)) {
-                log('captureGenerationContext – discarding stale pendingEditedEntry', pendingEditedEntry.key);
-                pendingEditedEntry = null;
+        const activeParsed = parseMappingKey(activeKey);
+        const exactPending = getPendingEditedEntry(activeKey);
+        if (exactPending) {
+            sourceKey = exactPending.key;
+        } else if (activeParsed) {
+            // Preserve the old same-assistant behavior while allowing edits on
+            // independent turns to coexist. The newest edit for this assistant wins.
+            const sameAssistantEntries = Array.from(pendingEditedEntries.values()).filter((entry) => {
+                const parsed = parseMappingKey(entry.key);
+                return parsed?.assistantMesId === activeParsed.assistantMesId;
+            });
+            if (sameAssistantEntries.length) {
+                sourceKey = sameAssistantEntries[sameAssistantEntries.length - 1].key;
+            }
+        }
+        for (const entry of Array.from(pendingEditedEntries.values())) {
+            const pendingParsed = parseMappingKey(entry.key);
+            if (!pendingParsed || !doesAssistantExistForMesId(pendingParsed.assistantMesId)) {
+                log('captureGenerationContext – discarding stale pending edit', entry.key);
+                deletePendingEditedEntry(entry.key);
             }
         }
         let usedOverswipeKey = null;
@@ -937,19 +1020,7 @@
         pendingSwipeGenerationKey = null;
 
         const parsed = parseMappingKey(sourceKey);
-        let sourceUserText = null;
-        if (pendingEditedEntry && sourceKey && pendingEditedEntry.key === sourceKey && typeof pendingEditedEntry.text === 'string') {
-            sourceUserText = pendingEditedEntry.text;
-        }
-        if (typeof sourceUserText !== 'string' && sourceKey) {
-            const mappedText = getLinkedTextByKey(sourceKey);
-            if (typeof mappedText === 'string') {
-                sourceUserText = mappedText;
-            }
-        }
-        if (typeof sourceUserText !== 'string' && sourceKey) {
-            sourceUserText = getUserMesForKey(sourceKey);
-        }
+        let sourceUserText = sourceKey ? getPreferredUserTextForKey(sourceKey).text : null;
         if (typeof sourceUserText !== 'string') {
             sourceUserText = getLastUserMesFromChat() || getLastUserMesFromDom();
         }
@@ -1057,7 +1128,7 @@
         // generation successfully consumes it. Do not immediately replace the
         // freshly edited bubble with the older persisted link; doing so would show
         // one value while a normal send uses another.
-        if (pendingEditedEntry?.key === activeKey && typeof pendingEditedEntry.text === 'string') {
+        if (getPendingEditedEntry(activeKey)) {
             clearUserBubbleHighlightForActiveKey();
             return;
         }
@@ -1272,7 +1343,8 @@
         activeKey = null;
         pendingUserText = null;
         pendingNormalUserText = null;
-        pendingEditedEntry = null;
+        pendingEditedEntries.clear();
+        abandonPendingEditCleanup();
         generationContext = null;
         generationKey = null;
         generationType = null;
@@ -1355,6 +1427,8 @@
         if (dryRun === true) return;
         if (!shouldTrackGenerationType(type)) return;
 
+        const wasGenerating = isGenerating;
+        if (!wasGenerating) abandonPendingEditCleanup();
         generationWasStopped = false;
         isGenerating = true;
         generationSeq++;
@@ -1383,6 +1457,8 @@
         if (dryRun === true) return;
         if (!shouldTrackGenerationType(type)) return;
 
+        const wasGenerating = isGenerating;
+        if (!wasGenerating) abandonPendingEditCleanup();
         generationWasStopped = false;
         if (lateMessageCleanupTimer) {
             clearTimeout(lateMessageCleanupTimer);
@@ -1457,6 +1533,7 @@
             pendingGenerationType = null;
             pendingSwipeGenerationKey = null;
             didReceiveMessageForGeneration = false;
+            abandonPendingEditCleanup();
             log('GENERATION_AFTER_COMMANDS watchdog – cleared aborted generation state');
         }, GENERATION_AFTER_COMMANDS_WATCHDOG_MS);
     }
@@ -1536,10 +1613,9 @@
                 }
             }
         } else {
-            if (pendingEditedEntry && keyUsedForGeneration
-                && pendingEditedEntry.key === keyUsedForGeneration
-                && typeof pendingEditedEntry.text === 'string') {
-                userTextForMapping = pendingEditedEntry.text;
+            const pendingEdit = getPendingEditedEntry(keyUsedForGeneration);
+            if (pendingEdit) {
+                userTextForMapping = pendingEdit.text;
             } else if (generationContext
                 && typeof generationContext.sourceUserText === 'string'
                 && (!generationContext.sourceKey || generationContext.sourceKey === keyUsedForGeneration)) {
@@ -1569,6 +1645,7 @@
         });
         if (!storedKey) return;
         didReceiveMessageForGeneration = true;
+        pendingEditCleanupRequested = pendingEditKeysUsedForGeneration.size > 0;
         pendingSwipeGenerationKey = null;
         // Streaming can append several swipe alternatives in one generation before
         // MESSAGE_RECEIVED, all from the same user text. Backfill the siblings so
@@ -1576,11 +1653,6 @@
         backfillBatchSwipeMappings(msg, assistantMesId, swipeId, userTextForMapping);
         if (effectiveType === 'normal') {
             pendingNormalUserText = null;
-            pendingEditedEntry = null;
-        } else {
-            if (pendingEditedEntry && keyUsedForGeneration && pendingEditedEntry.key === keyUsedForGeneration) {
-                pendingEditedEntry = null;
-            }
         }
         pendingUserText = null;
         generationKey = null;
@@ -1589,6 +1661,11 @@
         generationWasStopped = false;
         requestChatSave();
         scheduleSwipeRenderAfterFrame(assistantMesId);
+        // Streaming finalization emits GENERATION_ENDED before MESSAGE_RECEIVED.
+        // In that ordering the successful receipt is the end of the tool chain.
+        if (!isGenerating && pendingEditCleanupRequested) {
+            clearConsumedPendingEdits();
+        }
     }
 
     function onCharacterMessageRendered(messageIndex) {
@@ -1629,6 +1706,9 @@
         const overswipeKeyToRestore = !didReceiveMessageForGeneration ? generationContext?._usedOverswipeKey : null;
 
         isGenerating = false;
+        if (didReceiveMessageForGeneration && pendingEditCleanupRequested) {
+            clearConsumedPendingEdits();
+        }
         if (overswipeKeyToRestore && hasLinkedTextByKey(overswipeKeyToRestore)) {
             pendingSwipeGenerationKey = overswipeKeyToRestore;
         } else if (!preserveForLateMessage) {
@@ -1649,6 +1729,7 @@
                 generationContext = null;
                 pendingGenerationType = null;
                 pendingSwipeGenerationKey = null;
+                abandonPendingEditCleanup();
                 log('GENERATION_ENDED – cleared stale preserved context', seqAtEnd);
             }, 5000);
         } else {
@@ -1760,7 +1841,6 @@
 
         if (!assistantIndexes.length) {
             activeKey = null;
-            pendingEditedEntry = null;
             pendingNormalUserText = editedText;
             clearAnySwipeLinkedHighlight();
             log('MESSAGE_EDITED – user has no assistant in turn; updated pending normal text:', editedText.substring(0, 60));
@@ -1784,7 +1864,7 @@
             activeKey = keyAtEdit;
         }
 
-        pendingEditedEntry = { key: keyAtEdit, text: editedText };
+        setPendingEditedEntry(keyAtEdit, editedText);
         log('MESSAGE_EDITED – pending keyed edit updated:', keyAtEdit, editedText.substring(0, 60), isLatestUser ? '(latest)' : '(non-latest)');
     }
 
@@ -1812,8 +1892,10 @@
         if (pendingSwipeGenerationKey && !doesAssistantExistForKey(pendingSwipeGenerationKey)) {
             pendingSwipeGenerationKey = null;
         }
-        if (pendingEditedEntry && typeof pendingEditedEntry.key === 'string' && !doesAssistantExistForKey(pendingEditedEntry.key)) {
-            pendingEditedEntry = null;
+        for (const entry of Array.from(pendingEditedEntries.values())) {
+            if (!doesAssistantExistForKey(entry.key)) {
+                deletePendingEditedEntry(entry.key);
+            }
         }
         if (generationContext?.sourceKey && !doesAssistantExistForKey(generationContext.sourceKey)) {
             generationContext = {
@@ -1853,13 +1935,23 @@
         generationKey = adjustKeyAfterSwipeDelete(generationKey, assistantMesId, swipeId);
         pendingSwipeGenerationKey = adjustKeyAfterSwipeDelete(pendingSwipeGenerationKey, assistantMesId, swipeId);
 
-        if (pendingEditedEntry && typeof pendingEditedEntry.key === 'string') {
-            const adjustedKey = adjustKeyAfterSwipeDelete(pendingEditedEntry.key, assistantMesId, swipeId);
-            if (adjustedKey) {
-                pendingEditedEntry = { ...pendingEditedEntry, key: adjustedKey };
-            } else {
-                pendingEditedEntry = null;
-            }
+        const adjustedPendingEntries = [];
+        for (const entry of pendingEditedEntries.values()) {
+            const adjustedKey = adjustKeyAfterSwipeDelete(entry.key, assistantMesId, swipeId);
+            if (adjustedKey) adjustedPendingEntries.push({ ...entry, key: adjustedKey });
+        }
+        pendingEditedEntries.clear();
+        for (const entry of adjustedPendingEntries) {
+            pendingEditedEntries.set(entry.key, entry);
+        }
+        const adjustedUsedKeys = [];
+        for (const key of pendingEditKeysUsedForGeneration) {
+            const adjustedKey = adjustKeyAfterSwipeDelete(key, assistantMesId, swipeId);
+            if (adjustedKey) adjustedUsedKeys.push(adjustedKey);
+        }
+        pendingEditKeysUsedForGeneration.clear();
+        for (const key of adjustedUsedKeys) {
+            pendingEditKeysUsedForGeneration.add(key);
         }
 
         if (generationContext?.sourceKey) {
@@ -1898,6 +1990,7 @@
             sentUserText = getLastUserMesFromChat() || getLastUserMesFromDom();
         }
         pendingNormalUserText = typeof sentUserText === 'string' ? sentUserText : null;
+        abandonPendingEditCleanup();
         activeKey = null;
         clearAnySwipeLinkedHighlight();
         log('MESSAGE_SENT – pending normal text:', pendingNormalUserText && pendingNormalUserText.substring(0, 60));
@@ -1984,6 +2077,24 @@
         }
     }
 
+    function findPendingEditForCoreAssistant(aiMsg, swipeId) {
+        const coreMesId = aiMsg?.mesid ?? aiMsg?.mesId ?? aiMsg?.message_id;
+        const entries = Array.from(pendingEditedEntries.values()).reverse();
+        for (const entry of entries) {
+            const parsed = parseMappingKey(entry.key);
+            if (!parsed || parsed.swipeId !== swipeId) continue;
+            if (coreMesId === parsed.assistantMesId
+                || (typeof coreMesId === 'string' && coreMesId === String(parsed.assistantMesId))) {
+                return entry;
+            }
+            const liveAssistant = resolveAssistantMsg(parsed.assistantMesId);
+            if (liveAssistant && aiMsg?.send_date != null && aiMsg.send_date === liveAssistant.send_date) {
+                return entry;
+            }
+        }
+        return null;
+    }
+
     /**
      * Patch every historical user turn that sits before an assistant message parked
      * on a NON-latest swipe, replacing its outgoing text with that swipe's linked
@@ -2004,26 +2115,14 @@
             if (!aiMsg || aiMsg.is_user || aiMsg.is_system) continue;
             const swipes = Array.isArray(aiMsg.swipes) ? aiMsg.swipes : null;
             const swipeId = getSwipeIdFromMsg(aiMsg);
-            const pendingParsed = parseMappingKey(pendingEditedEntry?.key);
-            const coreMesId = aiMsg.mesid ?? aiMsg.mesId ?? aiMsg.message_id;
-            const pendingAssistant = pendingParsed ? resolveAssistantMsg(pendingParsed.assistantMesId) : null;
-            const isPendingEditedSwipe = Boolean(
-                pendingParsed
-                && pendingParsed.swipeId === swipeId
-                && (
-                    coreMesId === pendingParsed.assistantMesId
-                    || (typeof coreMesId === 'string' && coreMesId === String(pendingParsed.assistantMesId))
-                    || (pendingAssistant && aiMsg.send_date != null && aiMsg.send_date === pendingAssistant.send_date)
-                )
-                && typeof pendingEditedEntry.text === 'string'
-            );
-            // The latest swipe's automatic link equals the canonical text by
-            // construction, so patching it would only override later canonical
-            // edits with stale text. A manual (user-pinned) link is authoritative
-            // everywhere, including the latest or only swipe.
+            const pendingEdit = findPendingEditForCoreAssistant(aiMsg, swipeId);
+            const isPendingEditedSwipe = Boolean(pendingEdit);
+            // A latest automatic link may be stale after a later canonical edit
+            // (especially across reload), so normal sends leave it canonical.
+            // A manual user-pinned link remains authoritative everywhere.
             const isLatestOrOnlySwipe = !swipes || swipeId >= swipes.length - 1;
             if (!isPendingEditedSwipe && isLatestOrOnlySwipe && !isManualLinkedUserText(aiMsg, swipeId)) continue;
-            const linked = isPendingEditedSwipe ? pendingEditedEntry.text : getLinkedUserText(aiMsg, swipeId);
+            const linked = isPendingEditedSwipe ? pendingEdit.text : getLinkedUserText(aiMsg, swipeId);
             if (typeof linked !== 'string') continue;
             let userIdx = -1;
             for (let j = i - 1; j >= 0; j--) {
@@ -2032,6 +2131,7 @@
             if (userIdx === -1) continue;
             const userMsg = chat[userIdx];
             if (!userMsg || typeof userMsg !== 'object') continue;
+            if (pendingEdit) markPendingEditUsed(pendingEdit.key);
             const processed = await reprocessUserTextForPrompt(chat, userMsg, linked, interceptorType);
             if (userMsg.mes === processed) continue;
             userMsg.mes = processed;
@@ -2067,9 +2167,10 @@
 
         let textSource = null;
         let textToPatch = null;
-        if (pendingEditedEntry && pendingEditedEntry.key === keyToUse && typeof pendingEditedEntry.text === 'string') {
+        const pendingEdit = getPendingEditedEntry(keyToUse);
+        if (pendingEdit) {
             textSource = 'edited';
-            textToPatch = pendingEditedEntry.text;
+            textToPatch = pendingEdit.text;
         } else if (generationContext
             && typeof generationContext.sourceUserText === 'string'
             && (!generationContext.sourceKey || generationContext.sourceKey === keyToUse)) {
@@ -2079,10 +2180,10 @@
             textSource = 'pending';
             textToPatch = pendingUserText;
         } else {
-            const mappedText = getLinkedTextByKey(keyToUse);
-            if (typeof mappedText === 'string') {
-                textSource = 'mapped';
-                textToPatch = mappedText;
+            const preferred = getPreferredUserTextForKey(keyToUse);
+            if (typeof preferred.text === 'string') {
+                textSource = preferred.source;
+                textToPatch = preferred.text;
             }
         }
         if (typeof textToPatch !== 'string') {
@@ -2162,6 +2263,8 @@
             skipPatch('target_mismatch', { type: interceptorType, keyToUse, resolvedUserIdx: userIdx });
             return;
         }
+
+        if (pendingEdit) markPendingEditUsed(pendingEdit.key);
 
         // Re-run SillyTavern's prompt-time preprocessing (regex / file content /
         // titles) on the replacement text so the swap doesn't drop it.
