@@ -271,7 +271,7 @@
      * Stale session intents (pendingEditedEntries) for the affected keys are
      * dropped so the manual choice is what the next generation actually uses.
      */
-    function applyManualLinkedText(assistantMesId, swipeIds, text) {
+    function applyManualLinkedText(assistantMesId, swipeIds, text, { save = true, scheduleRender = true } = {}) {
         const assistantMsg = resolveAssistantMsg(assistantMesId);
         if (!assistantMsg || !Array.isArray(swipeIds)) return false;
         let changed = false;
@@ -285,9 +285,9 @@
             deletePendingEditedEntry(`${assistantMesId}:${swipeId}`);
         }
         if (changed) {
-            requestChatSave();
+            if (save) requestChatSave();
             ensureEditsButtonForAssistant(assistantMesId);
-            scheduleSwipeRenderAfterFrame(assistantMesId);
+            if (scheduleRender) scheduleSwipeRenderAfterFrame(assistantMesId);
             log('Manual linked-text override for assistant', assistantMesId, 'swipes', swipeIds,
                 text == null ? '(unlinked)' : `-> ${text.substring(0, 60)}`);
         }
@@ -1373,6 +1373,10 @@
         }
         swipeRenderSeq++;
         editsButtonScanSeq++;
+        // Selection deletion: the menu and undo stack are chat-local.
+        cancelDeleteSelectionTimer();
+        removeDeleteMenu();
+        clearDeletionHistory();
         log('State cleared');
     }
 
@@ -1404,6 +1408,7 @@
     }
 
     function onChatChanged() {
+        removeDeleteMenu();
         const ctx = SillyTavern.getContext();
         const currentId = ctx.chatId || null;
         if (currentId !== lastChatId) {
@@ -1435,6 +1440,7 @@
         generationType = normalizeGenerationEventType(type);
         pendingGenerationType = generationType;
         didReceiveMessageForGeneration = false;
+        removeDeleteMenu();
 
         if (generationType === 'normal') {
             captureGenerationContext(generationType, { capturedAt: 'after_commands', overwrite: true });
@@ -1467,6 +1473,7 @@
         isGenerating = true;
         generationSeq++;
         generationType = normalizeGenerationEventType(type) || generationType;
+        removeDeleteMenu();
         pendingGenerationType = generationType;
         didReceiveMessageForGeneration = false;
         if (generationType === 'normal') {
@@ -1871,6 +1878,8 @@
     function onMessageDeleted(_chatLength) {
         invalidateMesElCache();
         clearAnySwipeLinkedHighlight();
+        removeDeleteMenu();
+        pruneDeletionHistory();
 
         const normalizedType = normalizeGenerationEventType(generationType || pendingGenerationType || generationContext?.type);
         const preserveGenerationState = isGenerating && isSwipeLikeType(normalizedType);
@@ -1964,6 +1973,15 @@
         }
 
         log('MESSAGE_SWIPE_DELETED – adjusted session keys for assistant', assistantMesId, 'deleted swipe', swipeId);
+        removeDeleteMenu();
+        for (let i = deletionHistory.length - 1; i >= 0; i--) {
+            const entry = deletionHistory[i];
+            const targetMesId = entry.kind === 'linked' ? entry.assistantMesId : entry.mesId;
+            if (targetMesId !== assistantMesId || entry.swipeId == null) continue;
+            if (entry.swipeId === swipeId) deletionHistory.splice(i, 1);
+            else if (entry.swipeId > swipeId) entry.swipeId--;
+        }
+        pruneDeletionHistory();
 
         refreshActiveKeyFromChat(assistantMesId);
         if (!activeKey || !hasLinkedTextByKey(activeKey)) {
@@ -2567,11 +2585,1166 @@
         }
     }
 
+    // ─── Delete Selection ────────────────────────────────────────────────────────
+    //
+    // Select text inside one message bubble, press the compact "Delete" button
+    // that appears next to the selection, and the selected text is removed from
+    // the message's *source*. The rendered selection is mapped back to source
+    // conservatively: every candidate span is re-rendered through
+    // messageFormatting and must reproduce the expected text, otherwise nothing
+    // is changed. Canonical user / assistant edits follow SillyTavern's own
+    // messageEditDone order (mutate → MESSAGE_EDITED → render → MESSAGE_UPDATED →
+    // saveChat). A user bubble that currently shows a swipe-linked text is edited
+    // through the manual linked-text override instead, leaving msg.mes untouched.
+
+    const DELETE_MENU_CLASS = 'swipe_delete_selection_menu';
+    const DELETE_BUTTON_CLASS = 'swipe_delete_selection_button';
+    const DELETE_UNDO_BUTTON_CLASS = 'swipe_delete_undo_button';
+    const DELETE_HISTORY_LIMIT = 15;
+    const DELETE_MAX_LAYOUT_NODES = 20000;
+    const DELETE_SELECTION_DEBOUNCE_MS = 150;
+    const DELETE_SKIPPED_TAGS = new Set(['STYLE', 'SCRIPT', 'TEMPLATE', 'NOSCRIPT']);
+    const DELETE_MD_SYNTAX_CHARS = new Set(['*', '_', '~', '`', '[', ']', '(', ')', '!', '#', '>', '|', '-', '+', '\\']);
+    // Longest run first so "**" is never mistaken for two "*" runs.
+    const DELETE_MD_RUNS = ['***', '**', '*', '___', '__', '_', '~~', '```', '`'];
+    const DELETE_BLOCKED_SELECTOR = 'textarea, input, [contenteditable], .edit_textarea, #curEditTextarea, .popup, dialog, .ctx-menu';
+
+    let deleteMenuEl = null;
+    let deleteSelectionTimer = null;
+    let deleteSelectionSeq = 0;
+    let deletionInFlight = false;
+    let pendingDeleteSelection = null; // { range, mesTextEl, mesEl } captured when the menu was shown
+    let deleteChatScrollEl = null;
+    const deletionHistory = []; // bounded undo stack, newest last
+
+    function notifyDeleteWarning(text) {
+        log('Delete selection –', text);
+        try {
+            if (typeof globalThis.toastr?.warning === 'function') globalThis.toastr.warning(text, 'Delete selection');
+        } catch { /* toast is best-effort */ }
+    }
+
+    function notifyDeleteError(text) {
+        console.warn(`[${EXTENSION_NAME}] Delete selection –`, text);
+        try {
+            if (typeof globalThis.toastr?.error === 'function') globalThis.toastr.error(text, 'Delete selection');
+        } catch { /* toast is best-effort */ }
+    }
+
+    function getDomSelection() {
+        try {
+            if (typeof document.getSelection === 'function') return document.getSelection();
+            if (typeof globalThis.getSelection === 'function') return globalThis.getSelection();
+        } catch { /* ignore */ }
+        return null;
+    }
+
+    function closestElementFromNode(node, selector) {
+        if (!node) return null;
+        const el = node.nodeType === 1 ? node : node.parentElement;
+        if (!el || typeof el.closest !== 'function') return null;
+        try {
+            return el.closest(selector);
+        } catch {
+            return null;
+        }
+    }
+
+    function isWhitespaceChar(ch) {
+        return ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r' || ch === '\f' || ch === '\v' || ch === ' ';
+    }
+
+    function normalizeRenderedText(text) {
+        return String(text ?? '').replace(/\s+/g, ' ').trim();
+    }
+
+    /**
+     * Walk `rootEl` iteratively and record, for every node, the offset into the
+     * concatenated text of its subtree entry and exit. Explicit stack + visited
+     * set + node cap: a cyclic or absurdly large tree yields `null` (refuse)
+     * instead of a hang. Non-rendered subtrees (style/script/template) are
+     * skipped so their text can't shift the offsets.
+     */
+    function collectTextLayout(rootEl, maxNodes = DELETE_MAX_LAYOUT_NODES) {
+        if (!rootEl || typeof rootEl !== 'object') return null;
+        const positions = new Map();
+        const visited = new Set();
+        const parts = [];
+        let offset = 0;
+        let visitedCount = 0;
+        const stack = [{ node: rootEl, exit: false }];
+        while (stack.length) {
+            const frame = stack.pop();
+            const node = frame.node;
+            if (frame.exit) {
+                const entry = positions.get(node);
+                if (entry) entry.exit = offset;
+                continue;
+            }
+            if (!node || typeof node !== 'object') continue;
+            if (visited.has(node)) return null; // cycle
+            visited.add(node);
+            if (++visitedCount > maxNodes) return null;
+
+            if (node.nodeType === 3) {
+                const text = typeof node.textContent === 'string' ? node.textContent
+                    : (typeof node.data === 'string' ? node.data : '');
+                positions.set(node, { enter: offset, exit: offset + text.length, length: text.length });
+                parts.push(text);
+                offset += text.length;
+                continue;
+            }
+            positions.set(node, { enter: offset, exit: offset, length: 0 });
+            if (node.nodeType !== 1 && node !== rootEl) continue; // comments etc. carry no text
+            const tag = typeof node.tagName === 'string' ? node.tagName.toUpperCase() : '';
+            if (node !== rootEl && DELETE_SKIPPED_TAGS.has(tag)) continue;
+            stack.push({ node, exit: true });
+            const children = node.childNodes;
+            const childCount = children && typeof children.length === 'number' ? children.length : 0;
+            for (let i = childCount - 1; i >= 0; i--) stack.push({ node: children[i], exit: false });
+        }
+        return { text: parts.join(''), positions };
+    }
+
+    /**
+     * Turn a Range endpoint (container + offset) into an offset in layout.text.
+     * Handles text containers (character offset) and element containers (child
+     * index, as produced by double/triple-click selections). Unknown containers
+     * (detached, outside the message) yield `null`.
+     */
+    function resolveBoundaryOffset(layout, container, offset) {
+        if (!layout || !container || !layout.positions.has(container)) return null;
+        const entry = layout.positions.get(container);
+        if (!Number.isInteger(offset) || offset < 0) return null;
+        const numericOffset = offset;
+        if (container.nodeType === 3) {
+            return numericOffset <= entry.length ? entry.enter + numericOffset : null;
+        }
+        const children = container.childNodes;
+        const childCount = children && typeof children.length === 'number' ? children.length : 0;
+        if (numericOffset > childCount) return null;
+        if (numericOffset === childCount) return entry.exit;
+        const childEntry = layout.positions.get(children[Math.max(0, numericOffset)]);
+        return childEntry ? childEntry.enter : null;
+    }
+
+    function isPureMarkdownSyntax(text) {
+        if (!text) return false;
+        for (const ch of text) {
+            if (!DELETE_MD_SYNTAX_CHARS.has(ch) && !isWhitespaceChar(ch)) return false;
+        }
+        return true;
+    }
+
+    /**
+     * Single forward pass aligning rendered text to source text. Only markdown
+     * syntax characters, link targets, HTML tags and whitespace may be skipped in
+     * the source; any other mismatch aborts (`null`) instead of guessing. Each
+     * iteration advances at least one index, so it always terminates.
+     *
+     * Returns the source segments that produced rendered[selStart, selEnd). Gaps
+     * between matched characters that are pure markdown syntax (the `**` between
+     * two selected words) are folded into the segment; gaps with real content
+     * (a link target, an HTML tag) are kept, so deleting "docs now" out of
+     * "[the docs](url) now" leaves "[the](url)".
+     */
+    function alignRenderedToSource(rendered, source, selStart, selEnd) {
+        if (typeof rendered !== 'string' || typeof source !== 'string') return null;
+        if (!Number.isInteger(selStart) || !Number.isInteger(selEnd)) return null;
+        if (selStart < 0 || selEnd > rendered.length || selStart >= selEnd) return null;
+        let r = 0;
+        let s = 0;
+        const matched = []; // source indexes of the characters rendered inside the selection
+        while (r < selEnd && s < source.length) {
+            if (rendered[r] === source[s]) {
+                if (r >= selStart) matched.push(s);
+                r++;
+                s++;
+                continue;
+            }
+            const sc = source[s];
+            if (sc === ']' && source[s + 1] === '(') {
+                const close = source.indexOf(')', s + 2);
+                if (close !== -1) {
+                    s = close + 1;
+                    continue;
+                }
+            }
+            if (sc === '<') {
+                const close = source.indexOf('>', s + 1);
+                if (close !== -1) {
+                    s = close + 1;
+                    continue;
+                }
+            }
+            if (DELETE_MD_SYNTAX_CHARS.has(sc) || isWhitespaceChar(sc)) {
+                s++;
+                continue;
+            }
+            if (isWhitespaceChar(rendered[r])) {
+                r++;
+                continue;
+            }
+            return null;
+        }
+        if (r < selEnd || !matched.length) return null;
+
+        const segments = [];
+        let segStart = matched[0];
+        let segEnd = matched[0] + 1;
+        for (let i = 1; i < matched.length; i++) {
+            const idx = matched[i];
+            if (idx === segEnd || isPureMarkdownSyntax(source.slice(segEnd, idx))) {
+                segEnd = idx + 1;
+                continue;
+            }
+            segments.push({ start: segStart, end: segEnd });
+            segStart = idx;
+            segEnd = idx + 1;
+        }
+        segments.push({ start: segStart, end: segEnd });
+        return { start: segments[0].start, end: segments[segments.length - 1].end, segments };
+    }
+
+    function findRunBefore(source, index) {
+        for (const run of DELETE_MD_RUNS) {
+            const from = index - run.length;
+            if (from < 0) continue;
+            if (source.slice(from, index) !== run) continue;
+            if (from > 0 && source[from - 1] === run[0]) continue;
+            return run;
+        }
+        return null;
+    }
+
+    function findRunAfter(source, index) {
+        for (const run of DELETE_MD_RUNS) {
+            if (source.slice(index, index + run.length) !== run) continue;
+            if (source[index + run.length] === run[0]) continue;
+            return run;
+        }
+        return null;
+    }
+
+    function countStandaloneRuns(text, run) {
+        let count = 0;
+        let i = 0;
+        while (i < text.length) {
+            if (text.startsWith(run, i) && (i === 0 || text[i - 1] !== run[0]) && text[i + run.length] !== run[0]) {
+                count++;
+                i += run.length;
+            } else {
+                i++;
+            }
+        }
+        return count;
+    }
+
+    function findClosingBracket(source, openIndex, openChar, closeChar) {
+        let depth = 0;
+        for (let i = openIndex; i < source.length; i++) {
+            const ch = source[i];
+            if (ch === openChar) depth++;
+            else if (ch === closeChar) {
+                depth--;
+                if (depth === 0) return i;
+            } else if (ch === '\n' && openChar === '(') {
+                return -1; // a link target never spans lines
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * Widen a source span so that removing it leaves well-formed Markdown:
+     * deleting all of `**bold**` takes the delimiters too, deleting a whole link
+     * label takes the whole `[label](url)`, and partial deletions next to a
+     * delimiter don't leave `** text**`. Returns null for invalid input.
+     */
+    function adjustSpanForMarkdown(source, start, end) {
+        if (typeof source !== 'string' || !Number.isInteger(start) || !Number.isInteger(end)) return null;
+        if (start < 0 || end > source.length || start >= end) return null;
+
+        // Emphasis / strike / code runs.
+        const applyRunRules = () => {
+            const before = findRunBefore(source, start);
+            const after = findRunAfter(source, end);
+            if (before && after && before === after) {
+                start -= before.length;
+                end += after.length;
+                return true;
+            }
+            const inner = source.slice(start, end);
+            if (before && countStandaloneRuns(inner, before) === 1) {
+                start -= before.length; // opener outside, closer inside → take the opener too
+                return true;
+            }
+            if (after && countStandaloneRuns(inner, after) === 1) {
+                end += after.length; // opener inside, closer outside → take the closer too
+                return true;
+            }
+            let changed = false;
+            if (before && (source[end] === ' ' || source[end] === '\t')) {
+                let e = end;
+                while (e < source.length && (source[e] === ' ' || source[e] === '\t')) e++;
+                end = e;
+                changed = true;
+            }
+            if (after && (source[start - 1] === ' ' || source[start - 1] === '\t')) {
+                let s = start;
+                while (s > 0 && (source[s - 1] === ' ' || source[s - 1] === '\t')) s--;
+                start = s;
+                changed = true;
+            }
+            return changed;
+        };
+        if (applyRunRules()) {
+            // Whitespace trimming may have emptied the emphasis: re-check once.
+            const before = findRunBefore(source, start);
+            const after = findRunAfter(source, end);
+            if (before && after && before === after) {
+                start -= before.length;
+                end += after.length;
+            }
+        }
+
+        // Links and images.
+        const labelOpen = source[start - 1] === '[' ? (source[start - 2] === '!' ? start - 2 : start - 1) : -1;
+        const tailOpener = source[end] === ']' && (source[end + 1] === '(' || source[end + 1] === '[') ? source[end + 1] : null;
+        if (labelOpen !== -1 && tailOpener) {
+            const close = findClosingBracket(source, end + 1, tailOpener, tailOpener === '(' ? ')' : ']');
+            if (close !== -1) {
+                start = labelOpen;
+                end = close + 1;
+            }
+        } else if (labelOpen !== -1) {
+            const inner = source.slice(start, end);
+            if (inner.includes('](') || inner.includes('][')) start = labelOpen;
+        } else if (tailOpener) {
+            const inner = source.slice(start, end);
+            if (inner.includes('[')) {
+                const close = findClosingBracket(source, end + 1, tailOpener, tailOpener === '(' ? ')' : ']');
+                if (close !== -1) end = close + 1;
+            }
+        }
+
+        if (start < 0 || end > source.length || start >= end) return null;
+        return { start, end };
+    }
+
+    /**
+     * Map a rendered selection [selStart, selEnd) of layoutText to a span of
+     * `source` and return the resulting text. `renderToText(source)` must produce
+     * the rendered plain text for any source string (the same pipeline that
+     * produced the bubble). Alignment only proposes a span: temporary boundary
+     * markers must render at the selected positions before that span is trusted.
+     * Comparing the final plain text alone cannot distinguish repeated text.
+     */
+    function computeDeletionSpan({ source, layoutText, selStart, selEnd, renderToText }) {
+        if (typeof source !== 'string' || typeof layoutText !== 'string') return { error: 'invalid_input' };
+        if (typeof renderToText !== 'function') return { error: 'no_renderer' };
+        if (!Number.isInteger(selStart) || !Number.isInteger(selEnd)) return { error: 'invalid_selection' };
+        if (selStart < 0 || selEnd > layoutText.length || selStart >= selEnd) return { error: 'invalid_selection' };
+        const selText = layoutText.slice(selStart, selEnd);
+        if (selText.trim() === '') return { error: 'whitespace_selection' };
+
+        let baseline;
+        try {
+            baseline = renderToText(source);
+        } catch (e) {
+            log('computeDeletionSpan – baseline render failed', e?.message);
+            return { error: 'render_failed' };
+        }
+        if (typeof baseline !== 'string' || normalizeRenderedText(baseline) !== normalizeRenderedText(layoutText)) {
+            return { error: 'display_mismatch' };
+        }
+        const expected = normalizeRenderedText(layoutText.slice(0, selStart) + layoutText.slice(selEnd));
+
+        const tryCandidate = (candidate) => {
+            const rawSegments = Array.isArray(candidate.segments) && candidate.segments.length
+                ? candidate.segments
+                : [{ start: candidate.start, end: candidate.end }];
+            const adjusted = [];
+            for (const segment of rawSegments) {
+                const widened = adjustSpanForMarkdown(source, segment.start, segment.end);
+                if (!widened) return null;
+                adjusted.push(widened);
+            }
+            adjusted.sort((a, b) => a.start - b.start);
+            const merged = [];
+            for (const segment of adjusted) {
+                const last = merged[merged.length - 1];
+                if (last && segment.start <= last.end) last.end = Math.max(last.end, segment.end);
+                else merged.push({ start: segment.start, end: segment.end });
+            }
+            let newText = '';
+            let cursor = 0;
+            for (const segment of merged) {
+                if (!Number.isInteger(segment.start) || !Number.isInteger(segment.end)) return null;
+                if (segment.start < cursor || segment.end > source.length || segment.start >= segment.end) return null;
+                newText += source.slice(cursor, segment.start);
+                cursor = segment.end;
+            }
+            newText += source.slice(cursor);
+            let got;
+            try {
+                got = renderToText(newText);
+            } catch {
+                return null;
+            }
+            if (typeof got !== 'string' || normalizeRenderedText(got) !== expected) return null;
+            return { start: merged[0].start, end: merged[merged.length - 1].end, segments: merged, newText };
+        };
+
+        const aligned = alignRenderedToSource(layoutText, source, selStart, selEnd);
+        if (!aligned) return { error: 'unmappable' };
+        const startMarker = 'SWIPEDELETESTARTBOUNDARY';
+        const endMarker = 'SWIPEDELETEENDBOUNDARY';
+        if ([startMarker, endMarker].some((marker) => source.includes(marker) || layoutText.includes(marker))) {
+            return { error: 'ambiguous' };
+        }
+        const markedSource = source.slice(0, aligned.start) + startMarker
+            + source.slice(aligned.start, aligned.end) + endMarker + source.slice(aligned.end);
+        const markedExpected = layoutText.slice(0, selStart) + startMarker
+            + layoutText.slice(selStart, selEnd) + endMarker + layoutText.slice(selEnd);
+        try {
+            if (normalizeRenderedText(renderToText(markedSource)) !== normalizeRenderedText(markedExpected)) {
+                return { error: 'ambiguous' };
+            }
+        } catch {
+            return { error: 'render_failed' };
+        }
+        return tryCandidate(aligned) ?? { error: 'unmappable' };
+    }
+
+    function describeDeletionError(code) {
+        switch (code) {
+            case 'whitespace_selection':
+                return 'Select some text to delete.';
+            case 'display_mismatch':
+                return 'The displayed text differs from the message source (macro, translation or display-only transformation); nothing was changed.';
+            case 'ambiguous':
+                return 'The selection matches several places in the message source; nothing was changed.';
+            case 'render_failed':
+                return 'Could not render the message for verification; nothing was changed.';
+            default:
+                return 'The selection could not be mapped to the message source; nothing was changed.';
+        }
+    }
+
+    function formatMessageHtml(source, target) {
+        const ctx = globalThis.SillyTavern?.getContext?.();
+        const msg = target?.msg;
+        if (typeof ctx?.messageFormatting === 'function') {
+            const name = msg?.name || (msg?.is_user ? ctx.name1 : ctx.name2) || '';
+            try {
+                const html = ctx.messageFormatting(source, name, Boolean(msg?.is_system), Boolean(msg?.is_user), target.mesId, {}, false);
+                return typeof html === 'string' ? html : '';
+            } catch (e) {
+                console.warn(`[${EXTENSION_NAME}] messageFormatting error:`, e);
+            }
+        }
+        const div = document.createElement('div');
+        div.textContent = source;
+        return div.innerHTML;
+    }
+
+    /** Rendered plain text for `source` via the same pipeline SillyTavern used for the bubble. */
+    function renderSourceToText(source, target) {
+        if (typeof source !== 'string') return null;
+        const scratch = document.createElement('div');
+        scratch.innerHTML = formatMessageHtml(source, target);
+        if (typeof scratch.querySelectorAll === 'function') {
+            for (const tag of ['style', 'script', 'template', 'noscript']) {
+                const nodes = scratch.querySelectorAll(tag);
+                if (nodes && typeof nodes.forEach === 'function') nodes.forEach((el) => el.remove());
+            }
+        }
+        return typeof scratch.textContent === 'string' ? scratch.textContent : '';
+    }
+
+    /**
+     * Decide what a deletion inside `mesEl` edits:
+     *  - assistant: msg.mes (+ the active swipes[] entry)
+     *  - canonical: a user message's msg.mes
+     *  - linked:    the linked user text of the assistant swipe currently shown in
+     *               this user bubble (data-swipe-linked="1"); msg.mes is untouched
+     * Returns null when the bubble must not be edited (system messages, bubbles
+     * showing a transformed display_text, or unresolvable linked state).
+     */
+    function resolveDeletionTarget(mesEl) {
+        const ctx = globalThis.SillyTavern?.getContext?.();
+        const chat = ctx?.chat;
+        if (!chat || !mesEl) return null;
+        const chatIndex = getChatIndexForMesEl(mesEl);
+        if (chatIndex == null) return null;
+        const msg = chat[chatIndex];
+        if (!msg || msg.is_system) return null;
+        const mesId = getMesIdFromChatIndex(chatIndex);
+        const textEl = getMesTextEl(mesEl);
+        if (!textEl) return null;
+        const base = { chatIndex, mesId, msg, mesEl, textEl };
+
+        if (!msg.is_user) {
+            if (typeof msg.extra?.display_text === 'string') return null;
+            if (typeof msg.mes !== 'string') return null;
+            return { ...base, kind: 'assistant', source: msg.mes };
+        }
+
+        if (mesEl.getAttribute('data-swipe-linked') === '1') {
+            const assistantIndexes = [];
+            for (let i = chatIndex + 1; i < chat.length; i++) {
+                const candidate = chat[i];
+                if (!candidate) continue;
+                if (candidate.is_user) break;
+                if (!candidate.is_system && hasAssistantContent(candidate)) assistantIndexes.push(i);
+            }
+            if (!assistantIndexes.length) return null;
+            let assistantIndex = assistantIndexes[assistantIndexes.length - 1];
+            const activeAssistantMesId = parseMappingKey(activeKey)?.assistantMesId ?? null;
+            if (activeAssistantMesId != null) {
+                const activeIdx = findChatIndexByMesId(activeAssistantMesId);
+                if (assistantIndexes.includes(activeIdx)) assistantIndex = activeIdx;
+            }
+            const aiMsg = chat[assistantIndex];
+            const assistantMesId = getMesIdFromChatIndex(assistantIndex);
+            const swipeId = resolveSwipeId(assistantMesId, aiMsg);
+            const linkedText = getLinkedUserText(aiMsg, swipeId);
+            if (typeof linkedText !== 'string') return null;
+            return { ...base, kind: 'linked', source: linkedText, aiMsg, assistantMesId, swipeId };
+        }
+
+        if (typeof msg.extra?.display_text === 'string') return null;
+        if (typeof msg.mes !== 'string') return null;
+        return { ...base, kind: 'canonical', source: msg.mes };
+    }
+
+    // ── Selection detection & menu ──
+
+    function getSelectionInfo() {
+        const selection = getDomSelection();
+        if (!selection || !(selection.rangeCount > 0) || selection.isCollapsed) return null;
+        let range;
+        try {
+            range = selection.getRangeAt(0);
+        } catch {
+            return null;
+        }
+        if (!range || range.collapsed) return null;
+        let text;
+        try {
+            text = String(range.toString());
+        } catch {
+            return null;
+        }
+        if (text.trim() === '') return null;
+        const startMesText = closestElementFromNode(range.startContainer, '.mes_text');
+        const endMesText = closestElementFromNode(range.endContainer, '.mes_text');
+        if (!startMesText || startMesText !== endMesText || !startMesText.isConnected) return null;
+        const mesEl = startMesText.closest('.mes');
+        if (!mesEl || !mesEl.closest('#chat')) return null;
+        return { selection, range, mesTextEl: startMesText, mesEl };
+    }
+
+    function isSelectionExcluded(info, allowInFlight = false) {
+        // Exclusion is decided from the Range itself, not document.activeElement:
+        // SillyTavern keeps focus on the send box most of the time (and touch or
+        // keyboard selections don't move it), so an activeElement check would hide
+        // the button for perfectly valid chat selections. Selections inside a
+        // textarea/contenteditable never resolve to a .mes_text text node anyway,
+        // and the native editor is caught via its .edit_textarea below.
+        if (closestElementFromNode(info.range.startContainer, DELETE_BLOCKED_SELECTOR)) return true;
+        if (closestElementFromNode(info.range.endContainer, DELETE_BLOCKED_SELECTOR)) return true;
+        if (info.mesTextEl.querySelector('.edit_textarea, #curEditTextarea')) return true;
+        if (deletionInFlight && !allowInFlight) return true;
+        if (isGenerating || hasActiveGenerationUi()) return true;
+        return false;
+    }
+
+    function processSelectionForDelete() {
+        const info = getSelectionInfo();
+        if (!info || isSelectionExcluded(info)) {
+            removeDeleteMenu();
+            return false;
+        }
+        const target = resolveDeletionTarget(info.mesEl);
+        if (!target || target.textEl !== info.mesTextEl) {
+            removeDeleteMenu();
+            return false;
+        }
+        let range = info.range;
+        try {
+            if (typeof info.range.cloneRange === 'function') range = info.range.cloneRange();
+        } catch { /* keep the live range */ }
+        pendingDeleteSelection = {
+            range, mesTextEl: info.mesTextEl, mesEl: info.mesEl,
+            chatId: lastChatId, msg: target.msg, source: target.source, kind: target.kind,
+            aiMsg: target.aiMsg, swipeId: target.swipeId ?? target.msg.swipe_id,
+            startContainer: range.startContainer, startOffset: range.startOffset,
+            endContainer: range.endContainer, endOffset: range.endOffset,
+        };
+        showDeleteMenu(range);
+        return true;
+    }
+
+    function ensureDeleteMenuEl() {
+        if (deleteMenuEl && deleteMenuEl.isConnected) return deleteMenuEl;
+        const menu = document.createElement('div');
+        menu.className = DELETE_MENU_CLASS;
+        const button = document.createElement('div');
+        button.className = `menu_button ${DELETE_BUTTON_CLASS}`;
+        button.textContent = 'Delete';
+        button.title = 'Delete the selected text from this message';
+        // pointerdown (not click) so the selection survives the press and touch
+        // devices don't deliver a second, synthesized mouse activation.
+        button.addEventListener('pointerdown', onDeleteMenuPointerDown);
+        menu.appendChild(button);
+        const host = document.body || document.documentElement;
+        if (!host) return null;
+        host.appendChild(menu);
+        deleteMenuEl = menu;
+        return menu;
+    }
+
+    function showDeleteMenu(range) {
+        if (!ensureDeleteMenuEl()) return;
+        positionDeleteMenu(range);
+    }
+
+    function positionDeleteMenu(range = pendingDeleteSelection?.range) {
+        if (!deleteMenuEl || !range || typeof range.getBoundingClientRect !== 'function') return;
+        let rect;
+        try {
+            rect = range.getBoundingClientRect();
+        } catch {
+            return;
+        }
+        if (!rect) return;
+        const viewportWidth = Number(globalThis.innerWidth) || 0;
+        const viewportHeight = Number(globalThis.innerHeight) || 0;
+        const menuWidth = Number(deleteMenuEl.offsetWidth) || 0;
+        const menuHeight = Number(deleteMenuEl.offsetHeight) || 0;
+        let left = Number(rect.left) || 0;
+        let top = (Number(rect.bottom) || 0) + 6;
+        if (viewportWidth && left + menuWidth > viewportWidth) left = viewportWidth - menuWidth - 4;
+        if (viewportHeight && top + menuHeight > viewportHeight) top = (Number(rect.top) || 0) - menuHeight - 6;
+        deleteMenuEl.style.left = `${Math.max(0, left)}px`;
+        deleteMenuEl.style.top = `${Math.max(0, top)}px`;
+    }
+
+    function removeDeleteMenu() {
+        if (deleteMenuEl) {
+            try {
+                deleteMenuEl.remove();
+            } catch { /* ignore */ }
+            deleteMenuEl = null;
+        }
+        pendingDeleteSelection = null;
+    }
+
+    function cancelDeleteSelectionTimer() {
+        if (deleteSelectionTimer) {
+            clearTimeout(deleteSelectionTimer);
+            deleteSelectionTimer = null;
+        }
+        deleteSelectionSeq++;
+    }
+
+    function onSelectionChange() {
+        if (deleteSelectionTimer) clearTimeout(deleteSelectionTimer);
+        const seq = ++deleteSelectionSeq;
+        deleteSelectionTimer = setTimeout(() => {
+            deleteSelectionTimer = null;
+            if (seq !== deleteSelectionSeq || !isCurrentInstance() || deletionInFlight) return;
+            try {
+                processSelectionForDelete();
+            } catch (e) {
+                console.warn(`[${EXTENSION_NAME}] selection processing failed`, e);
+                removeDeleteMenu();
+            }
+        }, DELETE_SELECTION_DEBOUNCE_MS);
+    }
+
+    function onDocumentPointerDown(e) {
+        if (!deleteMenuEl) return;
+        const target = e?.target;
+        if (target && typeof deleteMenuEl.contains === 'function' && deleteMenuEl.contains(target)) return;
+        removeDeleteMenu();
+    }
+
+    function onChatScroll() {
+        if (deleteMenuEl) positionDeleteMenu();
+    }
+
+    function onDeleteMenuPointerDown(e) {
+        if (e) {
+            if (typeof e.preventDefault === 'function') e.preventDefault();
+            if (typeof e.stopPropagation === 'function') e.stopPropagation();
+        }
+        if (deletionInFlight) return;
+        const pending = pendingDeleteSelection;
+        if (!pending) {
+            removeDeleteMenu();
+            return;
+        }
+        void executeSelectionDelete(pending);
+    }
+
+    function installDeleteSelectionListeners() {
+        document.addEventListener('selectionchange', onSelectionChange);
+        document.addEventListener('pointerdown', onDocumentPointerDown, true);
+        const chatEl = typeof document.getElementById === 'function' ? document.getElementById('chat') : null;
+        if (chatEl && typeof chatEl.addEventListener === 'function') {
+            chatEl.addEventListener('scroll', onChatScroll, { passive: true });
+            deleteChatScrollEl = chatEl;
+        }
+    }
+
+    function uninstallDeleteSelectionListeners() {
+        document.removeEventListener('selectionchange', onSelectionChange);
+        document.removeEventListener('pointerdown', onDocumentPointerDown, true);
+        if (deleteChatScrollEl && typeof deleteChatScrollEl.removeEventListener === 'function') {
+            deleteChatScrollEl.removeEventListener('scroll', onChatScroll);
+        }
+        deleteChatScrollEl = null;
+    }
+
+    // ── Applying the edit ──
+
+    function snapshotDeletionState(target) {
+        const { msg, textEl, mesEl } = target;
+        const ctx = globalThis.SillyTavern?.getContext?.();
+        const swipeId = typeof msg.swipe_id === 'number' ? msg.swipe_id : null;
+        const hasSwipeEntry = swipeId != null && Array.isArray(msg.swipes) && swipeId >= 0 && swipeId < msg.swipes.length;
+        return {
+            mes: msg.mes,
+            swipeId,
+            hasSwipeEntry,
+            swipeEntry: hasSwipeEntry ? msg.swipes[swipeId] : undefined,
+            innerHTML: textEl.innerHTML,
+            linkedAttr: mesEl.getAttribute('data-swipe-linked'),
+            pendingEntries: new Map(pendingEditedEntries),
+            pendingNormalUserText,
+            chat: ctx?.chat,
+            chatId: ctx?.chatId,
+            metadata: ctx?.chatMetadata,
+            hadTainted: Object.hasOwn(ctx?.chatMetadata ?? {}, 'tainted'),
+            tainted: ctx?.chatMetadata?.tainted,
+            activeKey,
+            linked: target.kind === 'linked'
+                ? { text: getLinkedUserText(target.aiMsg, target.swipeId), manual: isManualLinkedUserText(target.aiMsg, target.swipeId) }
+                : null,
+        };
+    }
+
+    function writeLinkedTextState(assistantMsg, swipeId, state) {
+        if (!assistantMsg || !Number.isFinite(swipeId)) return false;
+        if (state && typeof state.text === 'string') {
+            return setLinkedUserText(assistantMsg, swipeId, state.text, { manual: state.manual === true });
+        }
+        return deleteLinkedUserText(assistantMsg, swipeId);
+    }
+
+    function restoreDeletionState(target, snapshot) {
+        const { msg, textEl, mesEl } = target;
+        msg.mes = snapshot.mes;
+        if (snapshot.hasSwipeEntry && Array.isArray(msg.swipes)) msg.swipes[snapshot.swipeId] = snapshot.swipeEntry;
+        if (snapshot.linked) writeLinkedTextState(target.aiMsg, target.swipeId, snapshot.linked);
+        const ctx = globalThis.SillyTavern?.getContext?.();
+        if (ctx?.chat === snapshot.chat && ctx?.chatId === snapshot.chatId) {
+            pendingEditedEntries.clear();
+            for (const [key, entry] of snapshot.pendingEntries) pendingEditedEntries.set(key, entry);
+            pendingNormalUserText = snapshot.pendingNormalUserText;
+            activeKey = snapshot.activeKey;
+        }
+        if (snapshot.metadata) {
+            if (snapshot.hadTainted) snapshot.metadata.tainted = snapshot.tainted;
+            else delete snapshot.metadata.tainted;
+        }
+        try {
+            textEl.innerHTML = snapshot.innerHTML;
+        } catch { /* ignore */ }
+        if (snapshot.linkedAttr == null) mesEl.removeAttribute('data-swipe-linked');
+        else mesEl.setAttribute('data-swipe-linked', snapshot.linkedAttr);
+    }
+
+    async function emitMessageLifecycleEvent(ctx, eventKey, mesId) {
+        const eventName = ctx?.event_types?.[eventKey] ?? ctx?.eventTypes?.[eventKey];
+        if (!eventName || typeof ctx?.eventSource?.emit !== 'function') return;
+        await ctx.eventSource.emit(eventName, mesId);
+    }
+
+    function assertDeletionChatCurrent(ctx) {
+        const current = globalThis.SillyTavern?.getContext?.();
+        if (!isCurrentInstance() || current?.chat !== ctx?.chat || current?.chatId !== ctx?.chatId
+            || current?.groupId !== ctx?.groupId || current?.characterId !== ctx?.characterId) {
+            throw new Error('The chat changed during the edit');
+        }
+    }
+
+    async function persistChatNow(ctx) {
+        assertDeletionChatCurrent(ctx);
+        if (typeof ctx?.saveChat !== 'function' || typeof ctx?.getRequestHeaders !== 'function'
+            || typeof globalThis.fetch !== 'function' || !ctx.chatId) {
+            throw new Error('Verified chat saving is unavailable');
+        }
+        const isGroup = Boolean(ctx.groupId);
+        const character = ctx.characters?.[ctx.characterId];
+        if (!isGroup && !character?.avatar) throw new Error('Cannot identify the chat file');
+        // Use the native save API (including its integrity checks and save lock).
+        // It resolves even on some failures, so verify the exact serialized chat
+        // through the same read endpoints SillyTavern uses to load it.
+        const expected = JSON.stringify(ctx.chat);
+        const body = isGroup ? { id: ctx.chatId }
+            : { ch_name: character.name, file_name: ctx.chatId, avatar_url: character.avatar };
+        await ctx.saveChat();
+        assertDeletionChatCurrent(ctx);
+        const response = await globalThis.fetch(isGroup ? '/api/chats/group/get' : '/api/chats/get', {
+            method: 'POST', cache: 'no-store', headers: ctx.getRequestHeaders(),
+            body: JSON.stringify(body), signal: AbortSignal.timeout(10000),
+        });
+        if (!response.ok) throw new Error(`Could not verify chat save (${response.status})`);
+        const saved = await response.json();
+        assertDeletionChatCurrent(ctx);
+        if (!Array.isArray(saved) || !saved[0]?.chat_metadata || JSON.stringify(saved.slice(1)) !== expected) {
+            throw new Error('Saved chat does not contain the expected edit');
+        }
+    }
+
+    function renderMessageTextAfterEdit(target) {
+        const ctx = globalThis.SillyTavern?.getContext?.();
+        const { msg, mesId, textEl } = target;
+        if (typeof ctx?.updateMessageBlock === 'function') {
+            ctx.updateMessageBlock(mesId, msg);
+            return;
+        }
+        textEl.innerHTML = formatMessageHtml(typeof msg.mes === 'string' ? msg.mes : '', target);
+    }
+
+    function pushDeletionHistory(entry) {
+        deletionHistory.push(entry);
+        while (deletionHistory.length > DELETE_HISTORY_LIMIT) deletionHistory.shift();
+        updateUndoButtons();
+    }
+
+    /**
+     * Canonical user / assistant edit in SillyTavern's messageEditDone order.
+     * Any failure restores the snapshot (data, session state, DOM).
+     */
+    async function applyCanonicalTextChange(target, newText, { record = true } = {}) {
+        const ctx = { ...globalThis.SillyTavern?.getContext?.() };
+        const { msg, mesId } = target;
+        const snapshot = snapshotDeletionState(target);
+        try {
+            msg.mes = newText;
+            if (snapshot.hasSwipeEntry) msg.swipes[snapshot.swipeId] = newText;
+            if (ctx?.chatMetadata && typeof ctx.chatMetadata === 'object') ctx.chatMetadata.tainted = true;
+            await emitMessageLifecycleEvent(ctx, 'MESSAGE_EDITED', mesId);
+            assertDeletionChatCurrent(ctx);
+            renderMessageTextAfterEdit(target);
+            await emitMessageLifecycleEvent(ctx, 'MESSAGE_UPDATED', mesId);
+            await persistChatNow(ctx);
+        } catch (e) {
+            restoreDeletionState(target, snapshot);
+            console.warn(`[${EXTENSION_NAME}] Delete selection failed; previous message state restored`, e);
+            notifyDeleteError('Saving could not be confirmed. The message was restored locally; reload to check the saved chat.');
+            return false;
+        }
+        if (record) {
+            pushDeletionHistory({
+                chatId: lastChatId,
+                kind: target.kind,
+                mesId,
+                msg,
+                swipeId: snapshot.hasSwipeEntry ? snapshot.swipeId : null,
+                before: { mes: snapshot.mes, swipeEntry: snapshot.swipeEntry },
+                after: { mes: msg.mes, swipeEntry: snapshot.hasSwipeEntry ? msg.swipes[snapshot.swipeId] : undefined },
+            });
+        }
+        log('Delete selection – updated', target.kind, 'message', mesId, '->', String(msg.mes).substring(0, 60));
+        return true;
+    }
+
+    /**
+     * Linked-text-only edit: writes the linked user text of one assistant swipe
+     * through the existing manual override path (no MESSAGE_EDITED, msg.mes is
+     * untouched) and re-renders the bubble through the normal swipe render path.
+     */
+    async function applyLinkedTextChange(target, state, { record = true } = {}) {
+        const ctx = { ...globalThis.SillyTavern?.getContext?.() };
+        const { aiMsg, assistantMesId, swipeId, mesId } = target;
+        const snapshot = snapshotDeletionState(target);
+        const key = `${assistantMesId}:${swipeId}`;
+        try {
+            let wrote;
+            if (state && typeof state.text === 'string' && state.manual === true) {
+                wrote = applyManualLinkedText(assistantMesId, [swipeId], state.text, { save: false, scheduleRender: false });
+            } else {
+                // Undo of an automatic link (or an unlink): same bookkeeping as the
+                // manual path, but without the manual flag.
+                wrote = writeLinkedTextState(aiMsg, swipeId, state);
+                deletePendingEditedEntry(key);
+                if (wrote) {
+                    ensureEditsButtonForAssistant(assistantMesId);
+                }
+            }
+            if (!wrote) throw new Error(`linked text write failed for ${key}`);
+            handleSwipeChangeForAssistant(assistantMesId);
+            await persistChatNow(ctx);
+        } catch (e) {
+            restoreDeletionState(target, snapshot);
+            try {
+                assertDeletionChatCurrent(ctx);
+                handleSwipeChangeForAssistant(assistantMesId);
+            } catch { /* DOM was already restored from the snapshot */ }
+            console.warn(`[${EXTENSION_NAME}] Delete selection failed; previous linked text restored`, e);
+            notifyDeleteError('Saving could not be confirmed. The linked text was restored locally; reload to check the saved chat.');
+            return false;
+        }
+        if (record) {
+            pushDeletionHistory({
+                chatId: lastChatId,
+                kind: 'linked',
+                mesId,
+                msg: target.msg,
+                aiMsg,
+                assistantMesId,
+                swipeId,
+                before: { linked: snapshot.linked },
+                after: { linked: { text: getLinkedUserText(aiMsg, swipeId), manual: isManualLinkedUserText(aiMsg, swipeId) } },
+            });
+        }
+        log('Delete selection – updated linked text', key, '->', state?.text == null ? '(unlinked)' : state.text.substring(0, 60));
+        return true;
+    }
+
+    async function executeSelectionDelete(pending = pendingDeleteSelection) {
+        if (deletionInFlight) return false;
+        deletionInFlight = true;
+        try {
+            const range = pending?.range;
+            const mesTextEl = pending?.mesTextEl;
+            const mesEl = pending?.mesEl;
+            if (!range || !mesTextEl || !mesEl || !mesTextEl.isConnected || !mesEl.isConnected) return false;
+            const live = getSelectionInfo();
+            if (!live || isSelectionExcluded(live, true) || pending.chatId !== lastChatId
+                || live.mesTextEl !== mesTextEl || live.mesEl !== mesEl
+                || live.range.startContainer !== pending.startContainer || live.range.startOffset !== pending.startOffset
+                || live.range.endContainer !== pending.endContainer || live.range.endOffset !== pending.endOffset) {
+                notifyDeleteWarning('The selection changed; select the text again.');
+                return false;
+            }
+            if (isGenerating || hasActiveGenerationUi()) {
+                notifyDeleteWarning('Wait for the current generation to finish.');
+                return false;
+            }
+            const target = resolveDeletionTarget(mesEl);
+            if (!target || target.textEl !== mesTextEl || target.msg !== pending.msg
+                || target.source !== pending.source || target.kind !== pending.kind || target.aiMsg !== pending.aiMsg
+                || (target.swipeId ?? target.msg.swipe_id) !== pending.swipeId) {
+                notifyDeleteWarning('This message can no longer be edited here.');
+                return false;
+            }
+            const layout = collectTextLayout(mesTextEl);
+            if (!layout) {
+                notifyDeleteWarning('This message is too complex to map safely; nothing was changed.');
+                return false;
+            }
+            const selStart = resolveBoundaryOffset(layout, live.range.startContainer, live.range.startOffset);
+            const selEnd = resolveBoundaryOffset(layout, live.range.endContainer, live.range.endOffset);
+            if (selStart == null || selEnd == null || selEnd <= selStart) {
+                notifyDeleteWarning('The selection is no longer available.');
+                return false;
+            }
+            const span = computeDeletionSpan({
+                source: target.source,
+                layoutText: layout.text,
+                selStart,
+                selEnd,
+                renderToText: (text) => renderSourceToText(text, target),
+            });
+            if (!span || span.error) {
+                notifyDeleteWarning(describeDeletionError(span?.error));
+                return false;
+            }
+            if (target.kind === 'linked') {
+                return await applyLinkedTextChange(target, { text: span.newText, manual: true });
+            }
+            return await applyCanonicalTextChange(target, span.newText);
+        } catch (e) {
+            console.warn(`[${EXTENSION_NAME}] Delete selection failed`, e);
+            notifyDeleteError('Deleting the selection failed; nothing was changed.');
+            return false;
+        } finally {
+            removeDeleteMenu();
+            try {
+                const selection = getDomSelection();
+                if (selection && typeof selection.removeAllRanges === 'function') selection.removeAllRanges();
+            } catch { /* ignore */ }
+            deletionInFlight = false;
+        }
+    }
+
+    // ── Undo ──
+
+    function isDeletionEntryAlive(entry) {
+        if (!entry || entry.chatId !== lastChatId) return false;
+        const chat = globalThis.SillyTavern?.getContext?.()?.chat;
+        if (!chat) return false;
+        const chatIndex = findChatIndexByMesId(entry.mesId);
+        if (chatIndex == null || chat[chatIndex] !== entry.msg) return false;
+        if (entry.kind === 'linked') {
+            const aiMsg = resolveAssistantMsg(entry.assistantMesId);
+            if (!aiMsg || aiMsg !== entry.aiMsg) return false;
+            const swipeCount = Array.isArray(aiMsg.swipes) ? Math.max(1, aiMsg.swipes.length) : 1;
+            return entry.swipeId >= 0 && entry.swipeId < swipeCount;
+        }
+        if (entry.swipeId != null) {
+            return Array.isArray(entry.msg.swipes) && entry.swipeId < entry.msg.swipes.length;
+        }
+        return true;
+    }
+
+    function pruneDeletionHistory() {
+        for (let i = deletionHistory.length - 1; i >= 0; i--) {
+            if (!isDeletionEntryAlive(deletionHistory[i])) deletionHistory.splice(i, 1);
+        }
+        updateUndoButtons();
+    }
+
+    function clearDeletionHistory() {
+        deletionHistory.length = 0;
+        updateUndoButtons();
+    }
+
+    function findDeletionEntryIndexForMesId(mesId) {
+        for (let i = deletionHistory.length - 1; i >= 0; i--) {
+            const entry = deletionHistory[i];
+            if (entry.mesId === mesId && entry.chatId === lastChatId) return i;
+        }
+        return -1;
+    }
+
+    function ensureUndoButton(mesEl, show) {
+        if (!mesEl) return;
+        const host = mesEl.querySelector('.mes_buttons') || mesEl.querySelector('.extraMesButtons');
+        if (!host) return;
+        const existing = mesEl.querySelector(`.${DELETE_UNDO_BUTTON_CLASS}`);
+        if (!show) {
+            if (existing) existing.remove();
+            return;
+        }
+        if (existing) return;
+        const btn = document.createElement('div');
+        btn.className = `mes_button ${DELETE_UNDO_BUTTON_CLASS} fa-solid fa-rotate-left interactable`;
+        btn.title = 'Undo selection delete';
+        btn.setAttribute('data-i18n', '[title]Undo selection delete');
+        const editBtn = host.querySelector('.mes_edit');
+        if (editBtn && typeof host.insertBefore === 'function') host.insertBefore(btn, editBtn);
+        else host.appendChild(btn);
+    }
+
+    function updateUndoButtons() {
+        const wanted = new Set();
+        for (const entry of deletionHistory) {
+            if (entry.chatId === lastChatId) wanted.add(entry.mesId);
+        }
+        document.querySelectorAll(`.${DELETE_UNDO_BUTTON_CLASS}`).forEach((btn) => {
+            const mesEl = typeof btn.closest === 'function' ? btn.closest('.mes') : null;
+            const chatIndex = mesEl ? getChatIndexForMesEl(mesEl) : null;
+            const mesId = chatIndex != null ? getMesIdFromChatIndex(chatIndex) : null;
+            if (mesId == null || !wanted.has(mesId)) btn.remove();
+        });
+        for (const mesId of wanted) {
+            const chatIndex = findChatIndexByMesId(mesId);
+            const mesEl = chatIndex != null ? getMesElForChatIndex(chatIndex) : null;
+            if (mesEl) ensureUndoButton(mesEl, true);
+        }
+    }
+
+    function removeAllUndoButtons() {
+        document.querySelectorAll(`.${DELETE_UNDO_BUTTON_CLASS}`).forEach((el) => el.remove());
+    }
+
+    /**
+     * Undo the newest recorded deletion on this message. The entry must still
+     * describe the live state (same message object, same swipe, text unchanged
+     * since the deletion); otherwise it is dropped rather than applied blindly.
+     */
+    async function undoDeletionForMessage(mesEl) {
+        if (deletionInFlight) return false;
+        const chatIndex = getChatIndexForMesEl(mesEl);
+        if (chatIndex == null) return false;
+        const mesId = getMesIdFromChatIndex(chatIndex);
+        pruneDeletionHistory();
+        const index = findDeletionEntryIndexForMesId(mesId);
+        if (index === -1) return false;
+        const entry = deletionHistory[index];
+        deletionInFlight = true;
+        try {
+            const msg = entry.msg;
+            const textEl = getMesTextEl(mesEl);
+            if (!textEl) return false;
+            const base = { chatIndex, mesId, msg, mesEl, textEl };
+            if (entry.kind === 'linked') {
+                const current = getLinkedUserText(entry.aiMsg, entry.swipeId);
+                if (current !== entry.after.linked.text) {
+                    deletionHistory.splice(index, 1);
+                    notifyDeleteWarning('The linked text changed since that deletion; undo skipped.');
+                    return false;
+                }
+                deletionHistory.splice(index, 1);
+                const target = { ...base, kind: 'linked', source: current, aiMsg: entry.aiMsg, assistantMesId: entry.assistantMesId, swipeId: entry.swipeId };
+                const ok = await applyLinkedTextChange(target, entry.before.linked, { record: false });
+                if (!ok) deletionHistory.splice(index, 0, entry);
+                return ok;
+            }
+            if (entry.swipeId != null && msg.swipe_id !== entry.swipeId) {
+                notifyDeleteWarning('Swipe back to the edited variant to undo that deletion.');
+                return false;
+            }
+            if (msg.mes !== entry.after.mes) {
+                deletionHistory.splice(index, 1);
+                notifyDeleteWarning('The message changed since that deletion; undo skipped.');
+                return false;
+            }
+            deletionHistory.splice(index, 1);
+            const target = { ...base, kind: entry.kind, source: msg.mes };
+            const ok = await applyCanonicalTextChange(target, entry.before.mes, { record: false });
+            if (!ok) deletionHistory.splice(index, 0, entry);
+            return ok;
+        } catch (e) {
+            console.warn(`[${EXTENSION_NAME}] Undo failed`, e);
+            notifyDeleteError('Undo failed.');
+            return false;
+        } finally {
+            deletionInFlight = false;
+            updateUndoButtons();
+        }
+    }
+
+    function teardownDeleteSelection() {
+        uninstallDeleteSelectionListeners();
+        cancelDeleteSelectionTimer();
+        removeDeleteMenu();
+        deletionHistory.length = 0;
+        removeAllUndoButtons();
+        deletionInFlight = false;
+    }
+
     // ─── Delegated Click Handler ─────────────────────────────────────────────────
 
     function onDocumentClick(e) {
         const target = e.target;
         if (!(target instanceof Element)) return;
+
+        // "Undo selection delete" button.
+        const undoBtn = target.closest(`.${DELETE_UNDO_BUTTON_CLASS}`);
+        if (undoBtn) {
+            const undoMesEl = undoBtn.closest('.mes');
+            if (undoMesEl) void undoDeletionForMessage(undoMesEl);
+            return;
+        }
 
         // "View linked edits" button — handled regardless of swipe-detection mode.
         const editsBtn = target.closest(`.${EDITS_BUTTON_CLASS}`);
@@ -2623,6 +3796,7 @@
         unbindAllEvents();
         clearState();
         removeAllEditsButtons();
+        teardownDeleteSelection();
         hasMessageSwipedEvent = false;
         document.removeEventListener('click', onDocumentClick);
         document.removeEventListener('DOMContentLoaded', bootWithRuntimeBus);
@@ -2649,6 +3823,7 @@
 
         unbindAllEvents();
         document.removeEventListener('click', onDocumentClick);
+        uninstallDeleteSelectionListeners();
 
         // Register event handlers
         bindEvent(eventSource, event_types.CHAT_CHANGED, onChatChanged);
@@ -2684,6 +3859,8 @@
 
         // Delegated click handler for swipe buttons
         document.addEventListener('click', onDocumentClick);
+        // Selection-based "Delete" menu (selectionchange / outside pointerdown / chat scroll)
+        installDeleteSelectionListeners();
 
         // Initial capture for already-loaded chat
         requestAnimationFrame(() => {
