@@ -170,6 +170,68 @@ test('deleting an entire link label removes the whole link construct', async () 
     }
 });
 
+test('selections crossing formatting boundaries keep the surviving formatting valid', async () => {
+    const action = '*I wave at her.* "Hello, how are you today?" I asked.';
+    const cases = [
+        // Crossing a closer: the kept closer moves before the space.
+        { source: action, select: 'at her. "Hello', expected: '*I wave* , how are you today?" I asked.' },
+        // Starting right after a closer: the space after the selection is real text.
+        { source: action, select: ' "Hello,', expected: '*I wave at her.* how are you today?" I asked.' },
+        // Crossing an opener: the kept opener moves after the space.
+        { source: '"Hi," *she smiles softly.* ok', select: 'Hi," she', expected: '" *smiles softly.* ok' },
+        // Crossing a closer and an opener at once: both survivors stay italic.
+        { source: '*one two* three *four five*', select: 'two three four', expected: '*one  five*' },
+        // Pairs whose content is gone are removed, surviving pairs stay.
+        { source: 'She said *soft* and *loud* and *soft* again.', select: 'She said soft and loud', expected: ' and *soft* again.' },
+        // Showdown renders "..." as "…".
+        { source: 'Wait... *what* now', select: '… what', expected: 'Wait now' },
+        // An escape goes with the character it escapes.
+        { source: 'a \\*b\\* c', select: '*b*', expected: 'a c' },
+    ];
+    for (const { source, select, expected } of cases) {
+        const assistant = assistantMessage(source);
+        const chat = [{ is_user: true, mes: 'hi', send_date: 'user-1' }, assistant];
+        const assistantElement = renderedElement(1, assistant);
+        const harness = buildHarness(chat, [createMessageElement(0, { isUser: true, text: 'hi' }), assistantElement]);
+        harness.selectRenderedText(assistantElement.mesText, select);
+        await pressDelete(harness);
+        assert.equal(assistant.mes, expected, `deleting "${select}" from "${source}"`);
+        assert.equal(harness.toasts.warning.length, 0, `no warning for "${select}"`);
+    }
+});
+
+test('a selection ending on a paragraph break deletes the paragraph text', async () => {
+    const assistant = assistantMessage('First paragraph here.\n\nSecond paragraph.');
+    const chat = [{ is_user: true, mes: 'hi', send_date: 'user-1' }, assistant];
+    const assistantElement = renderedElement(1, assistant);
+    const harness = buildHarness(chat, [createMessageElement(0, { isUser: true, text: 'hi' }), assistantElement]);
+    harness.selectRenderedText(assistantElement.mesText, 'First paragraph here.\n');
+    await pressDelete(harness);
+    assert.equal(assistant.mes, '\n\nSecond paragraph.');
+    assert.equal(harness.toasts.warning.length, 0);
+});
+
+test('an edit that keeps the surviving formatting wins over a text-only match', () => {
+    const harness = buildHarness([], []);
+    const { computeDeletionSpan, formattingSignature } = harness.hooks();
+    // Like Showdown, a leading "* " turns the line into a list item: the plain
+    // text still matches, but the surviving words would change formatting.
+    const render = (text) => {
+        const isList = text.startsWith('* ');
+        const element = new FakeElement();
+        element.innerHTML = isList ? `<ul><li>${markdownFormatting(text.slice(2))}</li></ul>` : markdownFormatting(text);
+        return { text: element.textContent, signature: formattingSignature(element) };
+    };
+    const source = 'She said *soft* and *loud* again.';
+    const layoutText = render(source).text;
+    const selStart = layoutText.indexOf('She said soft and loud');
+    const selEnd = selStart + 'She said soft and loud'.length;
+    const span = computeDeletionSpan({ source, layoutText, selStart, selEnd, renderToText: render });
+    assert.equal(span.newText, ' again.');
+    const textOnly = computeDeletionSpan({ source, layoutText, selStart, selEnd, renderToText: (text) => render(text).text });
+    assert.equal(textOnly.newText, '* again.', 'without signatures the first text match is used');
+});
+
 test('macro-expanded or otherwise unmappable content is refused without changes', async () => {
     const assistant = assistantMessage('Hello {{user}} friend');
     const chat = [{ is_user: true, mes: 'hi', send_date: 'user-1' }, assistant];
@@ -246,6 +308,33 @@ test('historical swipe-linked user bubble edits only the linked text as a manual
     assert.equal(harness.calls.saveChat, 1);
     assert.equal(userElement.mesText.textContent, 'linked text');
     assert.equal(userElement.getAttribute('data-swipe-linked'), '1');
+});
+
+test('a swipe-linked bubble selection crossing emphasis edits the linked text', async () => {
+    const linked = '*I wave at her.* "Hello, how are you today?" I asked quietly.';
+    const user = { is_user: true, mes: '*I wave.* "Hi."', send_date: 'user-1' };
+    const assistant = assistantMessage('reply A', {
+        swipe_id: 0,
+        swipes: ['reply A', 'reply B'],
+        swipe_info: [
+            { extra: { linked_user_text: linked } },
+            { extra: { linked_user_text: user.mes } },
+        ],
+        extra: { linked_user_text: linked },
+    });
+    const chat = [user, assistant];
+    const userElement = renderedElement(0, user, { isUser: true });
+    const harness = buildHarness(chat, [userElement, renderedElement(1, assistant)]);
+    assert.equal(userElement.getAttribute('data-swipe-linked'), '1');
+
+    harness.selectRenderedText(userElement.mesText, 'at her. "Hello');
+    await pressDelete(harness);
+
+    assert.equal(harness.toasts.warning.length, 0);
+    assert.equal(user.mes, '*I wave.* "Hi."', 'canonical text untouched');
+    assert.equal(assistant.swipe_info[0].extra.linked_user_text, '*I wave* , how are you today?" I asked quietly.');
+    assert.equal(assistant.swipe_info[0].extra.linked_user_text_manual, true);
+    assert.equal(userElement.mesText.textContent, 'I wave , how are you today?" I asked quietly.');
 });
 
 test('assistant active-swipe deletion updates mes and the active swipes[] entry only', async () => {

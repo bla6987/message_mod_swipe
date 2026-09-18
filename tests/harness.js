@@ -315,19 +315,23 @@ class FakeEventSource {
 
 /**
  * Deterministic stand-in for SillyTavern's messageFormatting used by the
- * selection-deletion tests: a tiny Markdown subset plus `{{macro}}` → `MACRO`
- * to emulate content that the source text does not contain.
+ * selection-deletion tests: a tiny Markdown subset (with `\\*` escapes and
+ * Showdown's "..." → "…") plus `{{macro}}` → `MACRO` to emulate content that
+ * the source text does not contain.
  */
 function markdownFormatting(text) {
     if (typeof text !== 'string' || text === '') return '';
     const inline = (s) => s
+        .replace(/\\\*/g, '\uE000')
+        .replace(/\.\.\./g, '\u2026')
         .replace(/\{\{[^}]+\}\}/g, 'MACRO')
         .replace(/\*\*\*([^*]+)\*\*\*/g, '<strong><em>$1</em></strong>')
         .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
         .replace(/\*([^*\n]+)\*/g, '<em>$1</em>')
         .replace(/~~([^~]+)~~/g, '<del>$1</del>')
         .replace(/!\[([^\]]*)\]\(([^)]*)\)/g, '<img alt="$1" src="$2">')
-        .replace(/\[([^\]]+)\]\(([^)]*)\)/g, '<a href="$2">$1</a>');
+        .replace(/\[([^\]]+)\]\(([^)]*)\)/g, '<a href="$2">$1</a>')
+        .replace(/\uE000/g, '*');
     return text.trim().split(/\n{2,}/).map((p) => `<p>${inline(p).replace(/\n/g, '<br>\n')}</p>`).join('\n');
 }
 
@@ -539,6 +543,8 @@ function createHarness(chat, messageElements = [], options = {}) {
             resolveBoundaryOffset,
             alignRenderedToSource,
             adjustSpanForMarkdown,
+            buildDelimiterPreservingText,
+            formattingSignature,
             resolveDeletionTarget,
             processSelectionForDelete,
             executeSelectionDelete,

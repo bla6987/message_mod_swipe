@@ -2737,6 +2737,25 @@
     }
 
     /**
+     * End of the unrendered source construct starting at `s` (link target, HTML
+     * tag, single Markdown syntax or whitespace character), or null when the
+     * character at `s` must be rendered.
+     */
+    function skippableSourceEnd(source, s) {
+        const sc = source[s];
+        if (sc === ']' && source[s + 1] === '(') {
+            const close = source.indexOf(')', s + 2);
+            if (close !== -1) return close + 1;
+        }
+        if (sc === '<') {
+            const close = source.indexOf('>', s + 1);
+            if (close !== -1) return close + 1;
+        }
+        if (DELETE_MD_SYNTAX_CHARS.has(sc) || isWhitespaceChar(sc)) return s + 1;
+        return null;
+    }
+
+    /**
      * Single forward pass aligning rendered text to source text. Only markdown
      * syntax characters, link targets, HTML tags and whitespace may be skipped in
      * the source; any other mismatch aborts (`null`) instead of guessing. Each
@@ -2747,6 +2766,11 @@
      * two selected words) are folded into the segment; gaps with real content
      * (a link target, an HTML tag) are kept, so deleting "docs now" out of
      * "[the docs](url) now" leaves "[the](url)".
+     *
+     * Also returned for buildDelimiterPreservingText: `matched` (source indexes
+     * of the selected characters) and `skips`, the unrendered constructs from
+     * the previous rendered character up to the next one after the selection
+     * (`[beforeStart, afterEnd)` is covered by `matched` and `skips` exactly).
      */
     function alignRenderedToSource(rendered, source, selStart, selEnd) {
         if (typeof rendered !== 'string' || typeof source !== 'string') return null;
@@ -2754,31 +2778,28 @@
         if (selStart < 0 || selEnd > rendered.length || selStart >= selEnd) return null;
         let r = 0;
         let s = 0;
+        let beforeStart = -1;
         const matched = []; // source indexes of the characters rendered inside the selection
+        const skips = [];
         while (r < selEnd && s < source.length) {
+            if (r >= selStart && beforeStart < 0) beforeStart = s;
             if (rendered[r] === source[s]) {
                 if (r >= selStart) matched.push(s);
                 r++;
                 s++;
                 continue;
             }
-            const sc = source[s];
-            if (sc === ']' && source[s + 1] === '(') {
-                const close = source.indexOf(')', s + 2);
-                if (close !== -1) {
-                    s = close + 1;
-                    continue;
-                }
+            // Showdown renders "..." as a single "…".
+            if (rendered[r] === '\u2026' && source.startsWith('...', s)) {
+                if (r >= selStart) matched.push(s, s + 1, s + 2);
+                r++;
+                s += 3;
+                continue;
             }
-            if (sc === '<') {
-                const close = source.indexOf('>', s + 1);
-                if (close !== -1) {
-                    s = close + 1;
-                    continue;
-                }
-            }
-            if (DELETE_MD_SYNTAX_CHARS.has(sc) || isWhitespaceChar(sc)) {
-                s++;
+            const next = skippableSourceEnd(source, s);
+            if (next != null) {
+                if (r >= selStart) skips.push({ start: s, end: next });
+                s = next;
                 continue;
             }
             if (isWhitespaceChar(rendered[r])) {
@@ -2788,6 +2809,15 @@
             return null;
         }
         if (r < selEnd || !matched.length) return null;
+        // Unrendered syntax between the selection and the next rendered character
+        // (a closing `*` right after the selected text, a link target, ...).
+        while (s < source.length && (r >= rendered.length || rendered[r] !== source[s])) {
+            const next = skippableSourceEnd(source, s);
+            if (next == null) break;
+            skips.push({ start: s, end: next });
+            s = next;
+        }
+        const afterEnd = s;
 
         const segments = [];
         let segStart = matched[0];
@@ -2803,7 +2833,15 @@
             segEnd = idx + 1;
         }
         segments.push({ start: segStart, end: segEnd });
-        return { start: segments[0].start, end: segments[segments.length - 1].end, segments };
+        return {
+            start: segments[0].start,
+            end: segments[segments.length - 1].end,
+            segments,
+            matched,
+            skips,
+            beforeStart: Math.max(0, beforeStart),
+            afterEnd,
+        };
     }
 
     function findRunBefore(source, index) {
@@ -2932,35 +2970,228 @@
         return { start, end };
     }
 
+    const DELETE_HTML_VOID_TAGS = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'source', 'track', 'wbr']);
+
+    function isPunctuationChar(ch) {
+        return typeof ch === 'string' && ch !== '' && /[\p{P}\p{S}]/u.test(ch);
+    }
+
     /**
-     * Map a rendered selection [selStart, selEnd) of layoutText to a span of
-     * `source` and return the resulting text. `renderToText(source)` must produce
-     * the rendered plain text for any source string (the same pipeline that
-     * produced the bubble). Alignment only proposes a span: temporary boundary
-     * markers must render at the selected positions before that span is trusted.
-     * Comparing the final plain text alone cannot distinguish repeated text.
+     * Pairing role of an unrendered syntax token, judged in the original source.
+     * Emphasis and code runs use CommonMark's flanking rules (string edges count
+     * as whitespace); `open`/`close` mark runs that can only open or only close.
+     * Both kinds drop whitespace just inside their delimiters, which is why
+     * buildDelimiterPreservingText moves whitespace across them.
      */
-    function computeDeletionSpan({ source, layoutText, selStart, selEnd, renderToText }) {
-        if (typeof source !== 'string' || typeof layoutText !== 'string') return { error: 'invalid_input' };
-        if (typeof renderToText !== 'function') return { error: 'no_renderer' };
-        if (!Number.isInteger(selStart) || !Number.isInteger(selEnd)) return { error: 'invalid_selection' };
-        if (selStart < 0 || selEnd > layoutText.length || selStart >= selEnd) return { error: 'invalid_selection' };
-        const selText = layoutText.slice(selStart, selEnd);
-        if (selText.trim() === '') return { error: 'whitespace_selection' };
+    function classifySyntaxToken(source, start, end) {
+        const text = source.slice(start, end);
+        const token = { start, end, text, pairKey: null, canOpen: false, canClose: false, role: 'other' };
+        const ch = text[0];
+        if ((ch === '*' || ch === '_' || ch === '~' || ch === '`') && [...text].every((c) => c === ch)) {
+            const prev = start > 0 ? source[start - 1] : ' ';
+            const next = end < source.length ? source[end] : ' ';
+            token.canOpen = !isWhitespaceChar(next) && (!isPunctuationChar(next) || isWhitespaceChar(prev) || isPunctuationChar(prev));
+            token.canClose = !isWhitespaceChar(prev) && (!isPunctuationChar(prev) || isWhitespaceChar(next) || isPunctuationChar(next));
+            token.pairKey = `${ch === '`' ? 'code' : 'emphasis'}:${text}`;
+            if (token.canOpen !== token.canClose) token.role = token.canOpen ? 'open' : 'close';
+            return token;
+        }
+        if (text === '[' || text === '![') {
+            token.canOpen = true;
+            token.pairKey = 'link';
+            return token;
+        }
+        if (text.startsWith('](')) {
+            token.canClose = true;
+            token.pairKey = 'link';
+            return token;
+        }
+        const closeTag = /^<\/([a-z][\w-]*)\s*>$/i.exec(text);
+        if (closeTag) {
+            token.canClose = true;
+            token.pairKey = `html:${closeTag[1].toLowerCase()}`;
+            return token;
+        }
+        const openTag = /^<([a-z][\w-]*)\b[^>]*>$/i.exec(text);
+        if (openTag && !text.endsWith('/>') && !DELETE_HTML_VOID_TAGS.has(openTag[1].toLowerCase())) {
+            token.canOpen = true;
+            token.pairKey = `html:${openTag[1].toLowerCase()}`;
+        }
+        return token;
+    }
 
-        let baseline;
-        try {
-            baseline = renderToText(source);
-        } catch (e) {
-            log('computeDeletionSpan – baseline render failed', e?.message);
-            return { error: 'render_failed' };
+    /**
+     * Alternative deletion for selections that cross formatting boundaries,
+     * e.g. from inside `*action*` into the following "dialogue". Deletes only
+     * the selected characters and the whitespace between them, keeps the
+     * Markdown syntax that formats surviving text, removes syntax pairs whose
+     * content is now empty (`**`, `[](url)`), and moves whitespace across kept
+     * emphasis delimiters so a closer is not left after a space (`*a *`) nor an
+     * opener before one (`* a*`). Returns the new source, or null.
+     */
+    function buildDelimiterPreservingText(source, aligned) {
+        const { matched, skips, beforeStart, afterEnd } = aligned ?? {};
+        if (typeof source !== 'string' || !Array.isArray(matched) || !matched.length || !Array.isArray(skips)) return null;
+        const first = matched[0];
+        const last = matched[matched.length - 1];
+        if (!Number.isInteger(beforeStart) || !Number.isInteger(afterEnd) || beforeStart > first || afterEnd <= last) return null;
+        const matchedSet = new Set(matched);
+        const skipByStart = new Map(skips.map((skip) => [skip.start, skip]));
+
+        const pieces = [];
+        for (let i = beforeStart; i < afterEnd;) {
+            if (matchedSet.has(i)) {
+                pieces.push({ kind: 'content', start: i, end: i + 1 });
+                i++;
+                continue;
+            }
+            const skip = skipByStart.get(i);
+            if (!skip || skip.end <= i) return null;
+            const text = source.slice(i, skip.end);
+            const zone = i < first ? 'before' : (i > last ? 'after' : 'inside');
+            if (text.length === 1 && isWhitespaceChar(text)) {
+                pieces.push({ kind: 'ws', start: i, end: skip.end, text, zone });
+            } else {
+                const prev = pieces[pieces.length - 1];
+                const mergesRun = prev?.kind === 'syntax' && prev.end === i && text.length === 1
+                    && ((prev.text[0] === text && '*_~`'.includes(text)) || (prev.text === '!' && text === '['));
+                if (mergesRun) {
+                    prev.end = skip.end;
+                    prev.text += text;
+                } else {
+                    pieces.push({ kind: 'syntax', start: i, end: skip.end, text, zone });
+                }
+            }
+            i = skip.end;
         }
-        if (typeof baseline !== 'string' || normalizeRenderedText(baseline) !== normalizeRenderedText(layoutText)) {
-            return { error: 'display_mismatch' };
+
+        // Pair syntax whose content was entirely deleted. Nothing between two
+        // syntax pieces survives, so an opener directly followed (through other
+        // syntax) by its closer now formats nothing.
+        const stack = [];
+        for (let i = 0; i < pieces.length; i++) {
+            const piece = pieces[i];
+            if (piece.kind !== 'syntax') continue;
+            if (piece.text === '\\' && pieces[i + 1]?.kind === 'content') {
+                piece.remove = true; // escape of a deleted character
+                continue;
+            }
+            const token = classifySyntaxToken(source, piece.start, piece.end);
+            piece.token = token;
+            const top = stack[stack.length - 1];
+            if (token.canClose && top && top.token.pairKey === token.pairKey) {
+                stack.pop();
+                top.remove = true;
+                piece.remove = true;
+            } else if (token.canOpen) {
+                stack.push(piece);
+            }
         }
+
+        const seq = [];
+        let prefixStart = beforeStart;
+        while (prefixStart > 0 && isWhitespaceChar(source[prefixStart - 1])) prefixStart--;
+        if (prefixStart < beforeStart) seq.push({ kind: 'ws', text: source.slice(prefixStart, beforeStart) });
+        for (const piece of pieces) {
+            if (piece.kind === 'content' || piece.remove) continue;
+            if (piece.kind === 'ws') {
+                if (piece.zone !== 'inside') seq.push({ kind: 'ws', text: piece.text });
+                continue;
+            }
+            seq.push({ kind: 'syntax', text: piece.text, role: piece.token?.role ?? 'other' });
+        }
+        let suffixEnd = afterEnd;
+        while (suffixEnd < source.length && isWhitespaceChar(source[suffixEnd])) suffixEnd++;
+        if (suffixEnd > afterEnd) seq.push({ kind: 'ws', text: source.slice(afterEnd, suffixEnd) });
+
+        // Closers move left and openers move right past whitespace; each swap
+        // strictly advances one of them, and the guard bounds the loop anyway.
+        let changed = true;
+        for (let guard = 0; changed && guard <= seq.length * seq.length; guard++) {
+            changed = false;
+            for (let i = 0; i < seq.length - 1; i++) {
+                const a = seq[i];
+                const b = seq[i + 1];
+                if ((a.kind === 'ws' && b.role === 'close') || (a.role === 'open' && b.kind === 'ws')) {
+                    seq[i] = b;
+                    seq[i + 1] = a;
+                    changed = true;
+                }
+            }
+        }
+        // Moving whitespace can leave two runs side by side ("Say  **text**").
+        // Keep line breaks, which render as markup, but collapse plain spaces.
+        const joined = [];
+        for (const piece of seq) {
+            const prev = joined[joined.length - 1];
+            if (piece.kind === 'ws' && prev?.kind === 'ws') {
+                if (prev.text.includes('\n') || piece.text.includes('\n')) prev.text += piece.text;
+                else if (piece.text.length > prev.text.length) prev.text = piece.text;
+                continue;
+            }
+            joined.push({ ...piece });
+        }
+        return source.slice(0, prefixStart) + joined.map((piece) => piece.text).join('') + source.slice(suffixEnd);
+    }
+
+    function countNonWhitespace(text) {
+        let count = 0;
+        for (const ch of text) if (!/\s/.test(ch)) count++;
+        return count;
+    }
+
+    /** Normalizes a renderer result (plain text, or `{ text, signature }`). */
+    function readRenderOutput(output) {
+        if (typeof output === 'string') return { text: output, signature: null };
+        if (!output || typeof output.text !== 'string') return null;
+        return { text: output.text, signature: Array.isArray(output.signature) ? output.signature : null };
+    }
+
+    /** Source span covering every change between `source` and `newText`. */
+    function changedSpan(source, newText) {
+        let start = 0;
+        while (start < source.length && start < newText.length && source[start] === newText[start]) start++;
+        let end = source.length;
+        let newEnd = newText.length;
+        while (end > start && newEnd > start && source[end - 1] === newText[newEnd - 1]) {
+            end--;
+            newEnd--;
+        }
+        return { start, end };
+    }
+
+    /**
+     * Map one rendered selection to a source edit. The span proposed by the
+     * alignment is first checked with boundary markers, then each candidate
+     * edit is accepted only if it re-renders to exactly the expected text.
+     */
+    function mapDeletionSelection({ source, layoutText, selStart, selEnd, renderToText, baselineSignature = null }) {
         const expected = normalizeRenderedText(layoutText.slice(0, selStart) + layoutText.slice(selEnd));
+        let expectedSignature = null;
+        if (Array.isArray(baselineSignature)) {
+            const k1 = countNonWhitespace(layoutText.slice(0, selStart));
+            const k2 = k1 + countNonWhitespace(layoutText.slice(selStart, selEnd));
+            expectedSignature = [...baselineSignature.slice(0, k1), ...baselineSignature.slice(k2)];
+        }
+        // 'formatting' when the surviving text renders exactly as before, 'text'
+        // when only its characters match (e.g. a leftover `*` became a list
+        // bullet), null when the candidate is wrong.
+        const checkCandidate = (newText) => {
+            if (typeof newText !== 'string' || newText === source) return null;
+            let got;
+            try {
+                got = readRenderOutput(renderToText(newText));
+            } catch {
+                return null;
+            }
+            if (!got || normalizeRenderedText(got.text) !== expected) return null;
+            if (!expectedSignature || !got.signature) return 'formatting';
+            const same = got.signature.length === expectedSignature.length
+                && got.signature.every((path, i) => path === expectedSignature[i]);
+            return same ? 'formatting' : 'text';
+        };
 
-        const tryCandidate = (candidate) => {
+        const widenedCandidate = (candidate) => {
             const rawSegments = Array.isArray(candidate.segments) && candidate.segments.length
                 ? candidate.segments
                 : [{ start: candidate.start, end: candidate.end }];
@@ -2986,35 +3217,112 @@
                 cursor = segment.end;
             }
             newText += source.slice(cursor);
-            let got;
-            try {
-                got = renderToText(newText);
-            } catch {
-                return null;
-            }
-            if (typeof got !== 'string' || normalizeRenderedText(got) !== expected) return null;
             return { start: merged[0].start, end: merged[merged.length - 1].end, segments: merged, newText };
         };
 
         const aligned = alignRenderedToSource(layoutText, source, selStart, selEnd);
         if (!aligned) return { error: 'unmappable' };
-        const startMarker = 'SWIPEDELETESTARTBOUNDARY';
-        const endMarker = 'SWIPEDELETEENDBOUNDARY';
-        if ([startMarker, endMarker].some((marker) => source.includes(marker) || layoutText.includes(marker))) {
-            return { error: 'ambiguous' };
-        }
-        const markedSource = source.slice(0, aligned.start) + startMarker
-            + source.slice(aligned.start, aligned.end) + endMarker + source.slice(aligned.end);
-        const markedExpected = layoutText.slice(0, selStart) + startMarker
-            + layoutText.slice(selStart, selEnd) + endMarker + layoutText.slice(selEnd);
-        try {
-            if (normalizeRenderedText(renderToText(markedSource)) !== normalizeRenderedText(markedExpected)) {
-                return { error: 'ambiguous' };
+        // Word markers can glue onto an adjacent `_x_` and stop it rendering as
+        // emphasis, so invisible non-word markers get a second chance. Either
+        // pair rendering in place proves the position.
+        const markerPairs = [
+            ['SWIPEDELETESTARTBOUNDARY', 'SWIPEDELETEENDBOUNDARY'],
+            ['\u2063\u2064\u2063', '\u2064\u2063\u2064'],
+        ];
+        // A marker between `\` and the character it escapes would unescape it.
+        const escape = aligned.skips.find((skip) => skip.end === aligned.start && skip.end - skip.start === 1
+            && source[skip.start] === '\\');
+        const markStart = escape ? escape.start : aligned.start;
+        let verifiedPosition = false;
+        for (const [startMarker, endMarker] of markerPairs) {
+            if ([startMarker, endMarker].some((marker) => source.includes(marker) || layoutText.includes(marker))) continue;
+            const markedSource = source.slice(0, markStart) + startMarker
+                + source.slice(markStart, aligned.end) + endMarker + source.slice(aligned.end);
+            const markedExpected = layoutText.slice(0, selStart) + startMarker
+                + layoutText.slice(selStart, selEnd) + endMarker + layoutText.slice(selEnd);
+            try {
+                const marked = readRenderOutput(renderToText(markedSource));
+                if (marked && normalizeRenderedText(marked.text) === normalizeRenderedText(markedExpected)) {
+                    verifiedPosition = true;
+                    break;
+                }
+            } catch {
+                return { error: 'render_failed' };
             }
-        } catch {
+        }
+        if (!verifiedPosition) return { error: 'ambiguous' };
+
+        // Widening deletes whole Markdown constructs and yields the cleanest
+        // source; it cannot handle a selection that crosses a formatting
+        // boundary, which the delimiter-preserving edit handles instead. A
+        // candidate that keeps the surviving formatting wins; one that only
+        // matches the text is the last resort.
+        const candidates = [
+            () => widenedCandidate(aligned),
+            () => {
+                const preserved = buildDelimiterPreservingText(source, aligned);
+                if (typeof preserved !== 'string') return null;
+                const span = changedSpan(source, preserved);
+                return { ...span, segments: [span], newText: preserved };
+            },
+        ];
+        let textOnly = null;
+        for (const build of candidates) {
+            const candidate = build();
+            if (!candidate) continue;
+            const quality = checkCandidate(candidate.newText);
+            if (quality === 'formatting') return candidate;
+            if (quality === 'text' && !textOnly) textOnly = candidate;
+        }
+        return textOnly ?? { error: 'unmappable' };
+    }
+
+    /**
+     * Map a rendered selection [selStart, selEnd) of layoutText to a span of
+     * `source` and return the resulting text. `renderToText(source)` must produce
+     * the rendered plain text for any source string (the same pipeline that
+     * produced the bubble). Alignment only proposes a span: temporary boundary
+     * markers must render at the selected positions before that span is trusted.
+     * Comparing the final plain text alone cannot distinguish repeated text.
+     * `renderToText` may also return `{ text, signature }` (see
+     * formattingSignature) to prefer edits that keep the surviving formatting.
+     */
+    function computeDeletionSpan({ source, layoutText, selStart, selEnd, renderToText }) {
+        if (typeof source !== 'string' || typeof layoutText !== 'string') return { error: 'invalid_input' };
+        if (typeof renderToText !== 'function') return { error: 'no_renderer' };
+        if (!Number.isInteger(selStart) || !Number.isInteger(selEnd)) return { error: 'invalid_selection' };
+        if (selStart < 0 || selEnd > layoutText.length || selStart >= selEnd) return { error: 'invalid_selection' };
+        const selText = layoutText.slice(selStart, selEnd);
+        if (selText.trim() === '') return { error: 'whitespace_selection' };
+
+        let baseline;
+        try {
+            baseline = readRenderOutput(renderToText(source));
+        } catch (e) {
+            log('computeDeletionSpan – baseline render failed', e?.message);
             return { error: 'render_failed' };
         }
-        return tryCandidate(aligned) ?? { error: 'unmappable' };
+        if (!baseline || normalizeRenderedText(baseline.text) !== normalizeRenderedText(layoutText)) {
+            return { error: 'display_mismatch' };
+        }
+        const baselineSignature = baseline.signature?.length === countNonWhitespace(baseline.text) ? baseline.signature : null;
+
+        const result = mapDeletionSelection({ source, layoutText, selStart, selEnd, renderToText, baselineSignature });
+        if (!result.error) return result;
+        // A selection that starts or ends on a line or paragraph break (e.g. a
+        // triple-clicked paragraph) puts a boundary marker next to a break the
+        // renderer turns into markup, so retry without that edge whitespace.
+        let trimmedStart = selStart;
+        while (trimmedStart < selEnd && isWhitespaceChar(layoutText[trimmedStart])) trimmedStart++;
+        if (!layoutText.slice(selStart, trimmedStart).includes('\n')) trimmedStart = selStart;
+        let trimmedEnd = selEnd;
+        while (trimmedEnd > trimmedStart && isWhitespaceChar(layoutText[trimmedEnd - 1])) trimmedEnd--;
+        if (!layoutText.slice(trimmedEnd, selEnd).includes('\n')) trimmedEnd = selEnd;
+        if (trimmedStart === selStart && trimmedEnd === selEnd) return result;
+        const retry = mapDeletionSelection({
+            source, layoutText, selStart: trimmedStart, selEnd: trimmedEnd, renderToText, baselineSignature,
+        });
+        return retry.error ? result : retry;
     }
 
     function describeDeletionError(code) {
@@ -3049,8 +3357,44 @@
         return div.innerHTML;
     }
 
-    /** Rendered plain text for `source` via the same pipeline SillyTavern used for the bubble. */
-    function renderSourceToText(source, target) {
+    // Paragraphs and quote wrappers do not count as formatting: a deletion may
+    // legitimately merge two paragraphs or leave a quotation mark unpaired.
+    const DELETE_SIGNATURE_IGNORED_TAGS = new Set(['P', 'Q', 'BR']);
+
+    /**
+     * Formatting context of every non-whitespace character of `rootEl`'s text
+     * (the em/strong/a/code/... elements around it), in text order. Bounded like
+     * collectTextLayout; null when the tree is too large.
+     */
+    function formattingSignature(rootEl, maxNodes = DELETE_MAX_LAYOUT_NODES) {
+        const signature = [];
+        const stack = [{ node: rootEl, path: '' }];
+        let visitedCount = 0;
+        while (stack.length) {
+            const { node, path } = stack.pop();
+            if (!node || typeof node !== 'object') continue;
+            if (++visitedCount > maxNodes) return null;
+            if (node.nodeType === 3) {
+                const text = typeof node.textContent === 'string' ? node.textContent : '';
+                for (const ch of text) if (!/\s/.test(ch)) signature.push(path);
+                continue;
+            }
+            if (node.nodeType !== 1) continue;
+            const tag = typeof node.tagName === 'string' ? node.tagName.toUpperCase() : '';
+            if (node !== rootEl && DELETE_SKIPPED_TAGS.has(tag)) continue;
+            const childPath = node === rootEl || DELETE_SIGNATURE_IGNORED_TAGS.has(tag) ? path : `${path}/${tag}`;
+            const children = node.childNodes;
+            const childCount = children && typeof children.length === 'number' ? children.length : 0;
+            for (let i = childCount - 1; i >= 0; i--) stack.push({ node: children[i], path: childPath });
+        }
+        return signature;
+    }
+
+    /**
+     * Rendered plain text and formatting signature for `source` via the same
+     * pipeline SillyTavern used for the bubble.
+     */
+    function renderSourceForDeletion(source, target) {
         if (typeof source !== 'string') return null;
         const scratch = document.createElement('div');
         scratch.innerHTML = formatMessageHtml(source, target);
@@ -3060,7 +3404,10 @@
                 if (nodes && typeof nodes.forEach === 'function') nodes.forEach((el) => el.remove());
             }
         }
-        return typeof scratch.textContent === 'string' ? scratch.textContent : '';
+        return {
+            text: typeof scratch.textContent === 'string' ? scratch.textContent : '',
+            signature: formattingSignature(scratch),
+        };
     }
 
     /**
@@ -3561,7 +3908,7 @@
                 layoutText: layout.text,
                 selStart,
                 selEnd,
-                renderToText: (text) => renderSourceToText(text, target),
+                renderToText: (text) => renderSourceForDeletion(text, target),
             });
             if (!span || span.error) {
                 notifyDeleteWarning(describeDeletionError(span?.error));

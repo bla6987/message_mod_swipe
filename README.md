@@ -102,7 +102,12 @@ boundary markers verify the exact selected position before the proposed edit
 is verified by re-rendering it; repeated words in link URLs cannot redirect a
 deletion to another occurrence. Deleting all of `**bold**` or an
 entire link label removes the surrounding Markdown as well, and partial
-deletions inside formatting keep it valid. When the selection cannot be mapped
+deletions inside formatting keep it valid. A selection may cross formatting
+boundaries — e.g. from the middle of an `*action*` into the following
+`"dialogue"` — and the text that remains keeps its formatting; an edit that
+would change the formatting of untouched text is only used as a last resort.
+Ellipses (`...`, displayed as `…`) and escaped characters (`\*`) map back to
+their source too. When the selection cannot be mapped
 unambiguously — for example because the displayed text came from a macro,
 translation, or a display-only regex script — nothing is changed and a short
 warning is shown.
@@ -158,4 +163,4 @@ npm test
 5. `generate_interceptor` — ephemerally patches `msg.mes` on the selected user message in the outgoing prompt array. Patch precedence is `edited > generation-start snapshot > linked swipe text` to avoid race-dependent stale prompts.
 6. Manual overrides — the "Linked user edits" popup writes `linked_user_text` alongside a `linked_user_text_manual` flag. Flagged links are honored by the normal-send patcher even on the latest/only swipe; automatic writes (generation completion) clear the flag.
 7. `CHAT_CHANGED` — clears session-only lifecycle state. Persisted `swipe_info[].extra.linked_user_text` values remain in chat data and survive reloads, chat switches, and branching.
-8. Selection deletion — a debounced `selectionchange` listener shows the Delete button for selections inside one `.mes_text`. On delete, the `.mes_text` DOM is walked with a bounded iterative traversal to turn the Range endpoints into text offsets; a Markdown-aware alignment proposes source segments, boundary-marker renders verify their selected position, and the segments are widened for surrounding Markdown and re-rendered to verify the expected result. Canonical/assistant edits then follow `messageEditDone`'s order (`mes`/`swipes[]` → `MESSAGE_EDITED` → render → `MESSAGE_UPDATED` → `saveChat`), while a swipe-linked bubble goes through the manual linked-text override. Native saves are checked by reading back the serialized chat. A local snapshot is restored on failure, and a 15-entry undo stack restores the exact target and adjusts indexes on swipe deletion.
+8. Selection deletion — a debounced `selectionchange` listener shows the Delete button for selections inside one `.mes_text`. On delete, the `.mes_text` DOM is walked with a bounded iterative traversal to turn the Range endpoints into text offsets; a Markdown-aware alignment proposes source segments, boundary-marker renders verify their selected position, and candidate edits are re-rendered to verify the expected result: first the segments widened for surrounding Markdown, then an edit that keeps the delimiters of surviving text, drops pairs left empty, and moves whitespace so kept delimiters still open/close. A candidate that also keeps the per-character formatting of the surviving text is preferred over one that only matches its plain text. Selections whose edges fall on a line break are retried without that edge whitespace. Canonical/assistant edits then follow `messageEditDone`'s order (`mes`/`swipes[]` → `MESSAGE_EDITED` → render → `MESSAGE_UPDATED` → `saveChat`), while a swipe-linked bubble goes through the manual linked-text override. Native saves are checked by reading back the serialized chat. A local snapshot is restored on failure, and a 15-entry undo stack restores the exact target and adjusts indexes on swipe deletion.
