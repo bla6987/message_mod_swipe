@@ -141,6 +141,177 @@ test('regenerating after swiping away from the edited swipe still uses the edit'
     );
 });
 
+test('continuing from an older swipe keeps the earlier bubble on the text every prompt sends', async () => {
+    const olderReply = {
+        is_user: false,
+        mes: 'reply A',
+        send_date: 'assistant-1',
+        swipe_id: 0,
+        swipes: ['reply A', 'reply B'],
+        swipe_info: [
+            { extra: { linked_user_text: 'original' } },
+            { extra: { linked_user_text: 'edited' } },
+        ],
+        extra: { linked_user_text: 'original' },
+    };
+    const chat = [
+        { is_user: true, mes: 'edited', send_date: 'user-1' },
+        olderReply,
+    ];
+    const userElement = createMessageElement(0, { isUser: true, text: 'edited' });
+    const harness = createHarness(chat, [userElement, createMessageElement(1, { text: 'reply A' })]);
+    harness.runTimers();
+    assert.equal(userElement.mesText.textContent, 'original');
+
+    chat.push({ is_user: true, mes: 'follow-up', send_date: 'user-2' });
+    harness.messageElements.push(createMessageElement(2, { isUser: true, text: 'follow-up' }));
+    await harness.eventSource.emit(harness.eventTypes.MESSAGE_SENT, 2);
+    assert.equal(userElement.mesText.textContent, 'original');
+
+    await harness.eventSource.emit(harness.eventTypes.GENERATION_STARTED, 'normal', {}, false);
+    await harness.eventSource.emit(harness.eventTypes.GENERATION_AFTER_COMMANDS, 'normal', {}, false);
+    const normalCoreChat = chat.map((message, index) => ({ ...message, index }));
+    await harness.sandbox.swipeLinkedUserEditInterceptor(normalCoreChat, 4096, () => {}, 'normal');
+    assert.equal(normalCoreChat[0].mes, 'original');
+
+    const newReply = {
+        is_user: false,
+        mes: 'new reply',
+        send_date: 'assistant-2',
+        swipe_id: 0,
+        swipes: ['new reply'],
+        swipe_info: [{ extra: {} }],
+        extra: {},
+    };
+    chat.push(newReply);
+    harness.messageElements.push(createMessageElement(3, { text: 'new reply' }));
+    await harness.eventSource.emit(harness.eventTypes.MESSAGE_RECEIVED, 3, 'normal');
+    await harness.eventSource.emit(harness.eventTypes.GENERATION_ENDED);
+    harness.runTimers();
+    assert.equal(userElement.mesText.textContent, 'original');
+    assert.equal(userElement.getAttribute('data-swipe-linked'), '1');
+
+    // Selection deletion on that bubble edits the older reply's swipe link.
+    const target = harness.hooks().resolveDeletionTarget(userElement);
+    assert.equal(target.kind, 'linked');
+    assert.equal(target.assistantMesId, 1);
+    assert.equal(target.swipeId, 0);
+    assert.equal(target.source, 'original');
+
+    // Swiping the new reply must send the same text for the earlier turn.
+    newReply.swipe_id = 1;
+    await harness.eventSource.emit(harness.eventTypes.MESSAGE_SWIPED, 3);
+    await harness.eventSource.emit(harness.eventTypes.GENERATION_STARTED, 'swipe', {}, false);
+    await harness.eventSource.emit(harness.eventTypes.GENERATION_AFTER_COMMANDS, 'swipe', {}, false);
+    const swipeCoreChat = chat.slice(0, 3).map((message, index) => ({ ...message, index }));
+    await harness.sandbox.swipeLinkedUserEditInterceptor(swipeCoreChat, 4096, () => {}, 'swipe');
+    assert.equal(swipeCoreChat[0].mes, 'original');
+    assert.equal(swipeCoreChat[2].mes, 'follow-up');
+});
+
+test('an edit made on an older swipe keeps being sent after continuing from it', async () => {
+    const olderReply = {
+        is_user: false,
+        mes: 'reply A',
+        send_date: 'assistant-1',
+        swipe_id: 0,
+        swipes: ['reply A', 'reply B'],
+        swipe_info: [
+            { extra: { linked_user_text: 'original' } },
+            { extra: { linked_user_text: 'original' } },
+        ],
+        extra: { linked_user_text: 'original' },
+    };
+    const chat = [
+        { is_user: true, mes: 'original', send_date: 'user-1' },
+        olderReply,
+    ];
+    const userElement = createMessageElement(0, { isUser: true, text: 'original' });
+    const harness = createHarness(chat, [userElement, createMessageElement(1, { text: 'reply A' })]);
+    harness.runTimers();
+
+    chat[0].mes = 'edited';
+    userElement.mesText.innerHTML = 'edited';
+    await harness.eventSource.emit(harness.eventTypes.MESSAGE_EDITED, 0);
+
+    const sendAndReply = async (text) => {
+        const userIndex = chat.length;
+        chat.push({ is_user: true, mes: text, send_date: `user-${userIndex}` });
+        await harness.eventSource.emit(harness.eventTypes.MESSAGE_SENT, userIndex);
+        await harness.eventSource.emit(harness.eventTypes.GENERATION_STARTED, 'normal', {}, false);
+        await harness.eventSource.emit(harness.eventTypes.GENERATION_AFTER_COMMANDS, 'normal', {}, false);
+        const coreChat = chat.map((message, index) => ({ ...message, index }));
+        await harness.sandbox.swipeLinkedUserEditInterceptor(coreChat, 4096, () => {}, 'normal');
+        chat.push({
+            is_user: false,
+            mes: `reply to ${text}`,
+            send_date: `assistant-${userIndex + 1}`,
+            swipe_id: 0,
+            swipes: [`reply to ${text}`],
+            swipe_info: [{ extra: {} }],
+            extra: {},
+        });
+        await harness.eventSource.emit(harness.eventTypes.MESSAGE_RECEIVED, userIndex + 1, 'normal');
+        await harness.eventSource.emit(harness.eventTypes.GENERATION_ENDED);
+        harness.runTimers();
+        return coreChat;
+    };
+
+    assert.equal((await sendAndReply('second'))[0].mes, 'edited');
+    // Previously the session-only edit was dropped here and the next prompt
+    // silently went back to the older swipe's link.
+    assert.equal((await sendAndReply('third'))[0].mes, 'edited');
+    assert.equal(olderReply.swipe_info[0].extra.linked_user_text, 'edited');
+    assert.equal(olderReply.swipe_info[0].extra.linked_user_text_manual, true);
+    assert.equal(olderReply.swipe_info[1].extra.linked_user_text, 'original');
+    assert.equal(userElement.mesText.textContent, 'edited');
+    assert.equal(userElement.hasAttribute('data-swipe-linked'), false);
+});
+
+test('quiet and impersonate prompts see the displayed history without consuming edits', async () => {
+    const olderReply = {
+        is_user: false,
+        mes: 'reply A',
+        send_date: 'assistant-1',
+        swipe_id: 0,
+        swipes: ['reply A', 'reply B'],
+        swipe_info: [
+            { extra: { linked_user_text: 'original' } },
+            { extra: { linked_user_text: 'edited' } },
+        ],
+        extra: { linked_user_text: 'original' },
+    };
+    const chat = [
+        { is_user: true, mes: 'edited', send_date: 'user-1' },
+        olderReply,
+        { is_user: true, mes: 'second', send_date: 'user-2' },
+        {
+            is_user: false,
+            mes: 'reply C',
+            send_date: 'assistant-2',
+            swipe_id: 0,
+            swipes: ['reply C'],
+            swipe_info: [{ extra: { linked_user_text: 'second' } }],
+            extra: { linked_user_text: 'second' },
+        },
+    ];
+    const harness = createHarness(chat);
+    harness.runTimers();
+
+    for (const type of ['quiet', 'impersonate']) {
+        const coreChat = chat.map((message, index) => ({ ...message, index }));
+        await harness.sandbox.swipeLinkedUserEditInterceptor(coreChat, 4096, () => {}, type);
+        assert.equal(coreChat[0].mes, 'original', type);
+    }
+
+    chat[2].mes = 'second edited';
+    await harness.eventSource.emit(harness.eventTypes.MESSAGE_EDITED, 2);
+    const quietCoreChat = chat.map((message, index) => ({ ...message, index }));
+    await harness.sandbox.swipeLinkedUserEditInterceptor(quietCoreChat, 4096, () => {}, 'quiet');
+    assert.equal(quietCoreChat[2].mes, 'second edited');
+    assert.deepEqual(Array.from(harness.hooks().getState().pendingEditKeysUsedForGeneration), []);
+});
+
 test('reload keeps canonical text visible for a latest automatic link', () => {
     const chat = [
         { is_user: true, mes: 'pencil edit', send_date: 'user-1' },

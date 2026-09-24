@@ -56,6 +56,13 @@ until you swipe to another variant. After that, every older swipe shows and
 sends the text it was generated from again; the edit stays the message's
 current text, so the latest swipe and the next regeneration still use it.
 
+When you continue the chat from an older swipe, that turn keeps its linked
+text: the earlier user bubble keeps showing it, and every later prompt —
+normal sends as well as swipes, regenerations and continuations of newer
+replies — sends that same text. An edit you made while the older swipe was on
+screen is kept for it as a manual override once the next reply uses it, so it
+does not quietly revert to the swipe's original text on later sends.
+
 ### View linked edits
 
 AI messages that have more than one swipe (or any recorded edit) get a small
@@ -99,8 +106,8 @@ What gets edited depends on the bubble:
   the edit is captured for the currently displayed AI swipe, exactly like a
   pencil edit.
 - **Your message while it shows a swipe-linked text** (the bubble has the thin
-  coloured border) — only the linked text of the AI swipe you are viewing is
-  changed, as a *manual override*. The canonical message text is left alone, so
+  coloured border) — only the linked text of the AI swipe that text comes from
+  (the reply below it, on its selected swipe) is changed, as a *manual override*. The canonical message text is left alone, so
   other swipes keep their own text.
 
 The rendered selection is mapped back to the Markdown source. Temporary
@@ -165,8 +172,8 @@ npm test
 1. `GENERATION_AFTER_COMMANDS` — snapshots user text for regeneration-like flows (`swipe`/`regenerate`/`continue`) before prompt assembly.
 2. `MESSAGE_SENT` + `MESSAGE_RECEIVED` — for `normal` sends, captures the just-sent user text at `MESSAGE_SENT` and writes it at `MESSAGE_RECEIVED`.
 3. Per-swipe persistence — generated variants store `linked_user_text` on `swipe_info[swipeId].extra`, with the active swipe mirrored to `msg.extra.linked_user_text` for SillyTavern's swipe sync.
-4. Swipe detection (SillyTavern's `MESSAGE_SWIPED` event, with DOM fallback) reads that per-swipe metadata and updates the displayed user bubble when a linked text exists.
-5. `generate_interceptor` — ephemerally patches `msg.mes` on the selected user message in the outgoing prompt array. Patch precedence is `edited > generation-start snapshot > linked swipe text` to avoid race-dependent stale prompts.
+4. One rule decides what every user turn sends: for the replies in its turn, a pending pencil edit on the selected swipe, else a manual override or a non-latest swipe's link (the last qualifying reply wins); otherwise the canonical text. Swipe detection (SillyTavern's `MESSAGE_SWIPED` event, with DOM fallback), sends, receipts, deletions and chat loads re-render every visible user bubble from that rule.
+5. `generate_interceptor` — ephemerally patches `msg.mes` in the outgoing prompt array. Every generation type patches historical turns with the rule above; `swipe`/`regenerate`/`continue` then patch their source turn with precedence `edited > generation-start snapshot > linked swipe text` to avoid race-dependent stale prompts. A consumed edit whose swipe stays selected in history is pinned as that swipe's manual override.
 6. Manual overrides — the "Linked user edits" popup writes `linked_user_text` alongside a `linked_user_text_manual` flag. Flagged links are honored by the normal-send patcher even on the latest/only swipe; automatic writes (generation completion) clear the flag.
 7. `CHAT_CHANGED` — clears session-only lifecycle state. Persisted `swipe_info[].extra.linked_user_text` values remain in chat data and survive reloads, chat switches, and branching.
 8. Selection deletion — a debounced `selectionchange` listener shows the Delete button for selections inside one `.mes_text`. On delete, the `.mes_text` DOM is walked with a bounded iterative traversal to turn the Range endpoints into text offsets; a Markdown-aware alignment proposes source segments, boundary-marker renders verify their selected position, and candidate edits are re-rendered to verify the expected result: first the segments widened for surrounding Markdown, then an edit that keeps the delimiters of surviving text, drops pairs left empty, and moves whitespace so kept delimiters still open/close. A candidate that also keeps the per-character formatting of the surviving text is preferred over one that only matches its plain text. Selections whose edges fall on a line break are retried without that edge whitespace. Canonical/assistant edits then follow `messageEditDone`'s order (`mes`/`swipes[]` → `MESSAGE_EDITED` → render → `MESSAGE_UPDATED` → `saveChat`), while a swipe-linked bubble goes through the manual linked-text override. Native saves are checked by reading back the serialized chat. A local snapshot is restored on failure, and a 15-entry undo stack restores the exact target and adjusts indexes on swipe deletion.

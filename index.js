@@ -157,11 +157,47 @@
     }
 
     function clearConsumedPendingEdits() {
+        let persisted = false;
         for (const key of pendingEditKeysUsedForGeneration) {
+            if (persistConsumedEditInHistory(key)) persisted = true;
             pendingEditedEntries.delete(key);
         }
         pendingEditKeysUsedForGeneration.clear();
         pendingEditCleanupRequested = false;
+        if (persisted) {
+            requestChatSave();
+            scheduleSwipeRenderAfterFrame(null);
+        }
+    }
+
+    /**
+     * A consumed edit on the latest reply moves to the swipe generated from it.
+     * But when the edited swipe stays selected in history (the user continued
+     * from it, or edited an earlier turn), dropping the session-only edit would
+     * silently revert the next prompt to that swipe's old link. Pin the edit as
+     * the swipe's manual override instead, so it keeps being sent and shown.
+     */
+    function persistConsumedEditInHistory(key) {
+        const entry = getPendingEditedEntry(key);
+        const parsed = parseMappingKey(key);
+        if (!entry || !parsed) return false;
+        const chat = SillyTavern.getContext().chat;
+        const assistantIndex = findChatIndexByMesId(parsed.assistantMesId);
+        const assistantMsg = assistantIndex != null ? chat?.[assistantIndex] : null;
+        if (!assistantMsg || assistantMsg.is_user || assistantMsg.is_system) return false;
+        if (assistantIndex === getLastAssistantIndexFromChat()) return false;
+        if (getSwipeIdFromMsg(assistantMsg) !== parsed.swipeId) return false;
+
+        const withoutEdit = resolveSelectedSwipeUserText(assistantMsg, null);
+        const userIndex = getTurnUserIndex(assistantIndex);
+        const sentWithoutEdit = withoutEdit
+            ? withoutEdit.text
+            : (userIndex != null ? getUserMessageText(chat[userIndex]) : null);
+        if (sentWithoutEdit === entry.text) return false;
+        if (!setLinkedUserText(assistantMsg, parsed.swipeId, entry.text, { manual: true })) return false;
+        ensureEditsButtonForAssistant(parsed.assistantMesId);
+        log('Pinned consumed edit on historical swipe', key, '->', entry.text.substring(0, 60));
+        return true;
     }
 
     function abandonPendingEditCleanup() {
@@ -1083,145 +1119,115 @@
         });
     }
 
-    function clearSwipeLinkedHighlightsExcept(exceptEl) {
-        const highlighted = document.querySelectorAll('#chat .mes[data-swipe-linked="1"]');
-        highlighted.forEach((el) => {
-            if (el === exceptEl) return;
+    /**
+     * The user text an assistant reply's SELECTED swipe makes its turn send: a
+     * pending pencil edit, else a manual override or a non-latest swipe's link.
+     * Automatic links on the latest swipe are not authoritative — the user may
+     * have pencil-edited the canonical message after that response, and the
+     * session-only edit marker is lost on reload — so they (and unlinked
+     * swipes) return null, meaning "the canonical message text". The bubble
+     * display and every prompt path share this rule so they cannot disagree.
+     */
+    function resolveSelectedSwipeUserText(aiMsg, pendingEdit) {
+        const swipeId = getSwipeIdFromMsg(aiMsg);
+        if (pendingEdit) return { text: pendingEdit.text, source: 'edited', swipeId, pendingEdit };
+        const swipes = Array.isArray(aiMsg.swipes) ? aiMsg.swipes : null;
+        const isLatestOrOnlySwipe = !swipes || swipeId >= swipes.length - 1;
+        const manual = isManualLinkedUserText(aiMsg, swipeId);
+        if (isLatestOrOnlySwipe && !manual) return null;
+        const linked = getLinkedUserText(aiMsg, swipeId);
+        if (typeof linked !== 'string') return null;
+        return { text: linked, source: manual ? 'manual' : 'linked', swipeId };
+    }
+
+    /**
+     * Chat index of the user message whose turn the assistant at
+     * `assistantIndex` belongs to. Hidden (is_system) messages are skipped,
+     * matching the prompt, which leaves them out entirely.
+     */
+    function getTurnUserIndex(assistantIndex) {
+        const chat = SillyTavern.getContext().chat;
+        if (!chat) return null;
+        for (let i = assistantIndex - 1; i >= 0; i--) {
+            if (chat[i]?.is_user && !chat[i].is_system) return i;
+        }
+        return null;
+    }
+
+    /**
+     * Resolve what the user message at `userIndex` sends (and so shows) from
+     * the replies in its turn. The last qualifying reply wins, matching the
+     * forward order in which the interceptor patches. Null = canonical text.
+     */
+    function resolveTurnUserText(userIndex) {
+        const chat = SillyTavern.getContext().chat;
+        const userMsg = chat?.[userIndex];
+        if (!userMsg?.is_user || userMsg.is_system) return null;
+        let resolved = null;
+        for (let i = userIndex + 1; i < chat.length; i++) {
+            const msg = chat[i];
+            if (!msg) continue;
+            if (msg.is_user && !msg.is_system) break;
+            if (msg.is_user || msg.is_system) continue;
+            const pending = getPendingEditedEntry(`${getMesIdFromChatIndex(i)}:${getSwipeIdFromMsg(msg)}`);
+            const candidate = resolveSelectedSwipeUserText(msg, pending);
+            if (candidate) resolved = { ...candidate, assistantIndex: i };
+        }
+        return resolved;
+    }
+
+    // textEl -> { text, html } of the last linked render, so repeated syncs skip
+    // identical work but notice SillyTavern re-rendering the row underneath.
+    const linkedBubbleRenders = new WeakMap();
+
+    function renderUserBubble(userIndex, resolved) {
+        const msg = SillyTavern.getContext().chat?.[userIndex];
+        const userEl = getMesElForChatIndex(userIndex);
+        if (!msg?.is_user || !userEl) return;
+
+        const text = resolved?.text;
+        const canonical = getUserDisplayText(msg);
+        if (typeof text !== 'string' || (canonical != null && text.trim() === canonical.trim())) {
+            if (userEl.hasAttribute('data-swipe-linked')) {
+                restoreUserBubbleFromChat(userEl);
+                userEl.removeAttribute('data-swipe-linked');
+            }
+            return;
+        }
+
+        const textEl = getMesTextEl(userEl);
+        if (!textEl) return;
+        const last = linkedBubbleRenders.get(textEl);
+        if (userEl.getAttribute('data-swipe-linked') === '1' && last?.text === text && last.html === textEl.innerHTML) return;
+        log('Updating user bubble', userIndex, 'to:', text.substring(0, 60));
+        textEl.innerHTML = formatUserMessageText(text, userIndex);
+        linkedBubbleRenders.set(textEl, { text, html: textEl.innerHTML });
+        userEl.setAttribute('data-swipe-linked', '1');
+    }
+
+    /**
+     * Bring every rendered user bubble in line with what the prompt sends.
+     * Only the few turns that resolve to a linked text (plus currently marked
+     * bubbles) touch the DOM, so this stays cheap on long chats.
+     */
+    function syncAllUserBubbles() {
+        const chat = SillyTavern.getContext().chat;
+        if (!chat) return;
+        const wanted = new Map();
+        for (let i = 0; i < chat.length; i++) {
+            if (!chat[i]?.is_user || chat[i].is_system) continue;
+            const resolved = resolveTurnUserText(i);
+            if (resolved) wanted.set(i, resolved);
+        }
+        document.querySelectorAll('#chat .mes[data-swipe-linked="1"]').forEach((el) => {
+            const chatIndex = getChatIndexForMesEl(el);
+            if (chatIndex != null && wanted.has(chatIndex)) return;
             restoreUserBubbleFromChat(el);
             el.removeAttribute('data-swipe-linked');
         });
-    }
-
-    function clearUserBubbleHighlightForAssistant(assistantMesId) {
-        if (assistantMesId == null) {
-            clearAnySwipeLinkedHighlight();
-            return;
+        for (const [userIndex, resolved] of wanted) {
+            renderUserBubble(userIndex, resolved);
         }
-
-        const assistantChatIndex = findChatIndexByMesId(assistantMesId);
-        if (assistantChatIndex == null) {
-            clearAnySwipeLinkedHighlight();
-            return;
-        }
-
-        const userIndex = getUserIndexBefore(assistantChatIndex);
-        if (userIndex == null) {
-            clearAnySwipeLinkedHighlight();
-            return;
-        }
-
-        const userEl = getMesElForChatIndex(userIndex);
-        if (!userEl) {
-            log('Could not resolve exact user message DOM element for index', userIndex);
-            clearAnySwipeLinkedHighlight();
-            return;
-        }
-
-        if (userEl.hasAttribute('data-swipe-linked')) {
-            restoreUserBubbleFromChat(userEl);
-        }
-        userEl.removeAttribute('data-swipe-linked');
-    }
-
-    function clearUserBubbleHighlightForActiveKey() {
-        if (!activeKey) {
-            clearAnySwipeLinkedHighlight();
-            return;
-        }
-
-        const m = /^([0-9]+):([0-9]+)$/.exec(activeKey);
-        if (!m) {
-            clearAnySwipeLinkedHighlight();
-            return;
-        }
-
-        clearUserBubbleHighlightForAssistant(Number(m[1]));
-    }
-
-    function updateUserBubbleForActiveKey() {
-        if (!activeKey) return;
-
-        // A pencil edit is the user's newest intent for this exact swipe until a
-        // generation successfully consumes it. Do not immediately replace the
-        // freshly edited bubble with the older persisted link; doing so would show
-        // one value while a normal send uses another.
-        if (getPendingEditedEntry(activeKey)) {
-            clearUserBubbleHighlightForActiveKey();
-            return;
-        }
-
-        // Automatic links on the latest swipe are deliberately not authoritative
-        // for normal sends: the user may have pencil-edited the canonical message
-        // after that response was generated. Keep the same policy in the UI so a
-        // reload cannot show the old automatic link while the prompt sends the
-        // canonical edit. Manual overrides remain authoritative everywhere.
-        const parsedActive = parseMappingKey(activeKey);
-        const activeAssistant = parsedActive ? resolveAssistantMsg(parsedActive.assistantMesId) : null;
-        if (activeAssistant && parsedActive) {
-            const swipes = Array.isArray(activeAssistant.swipes) ? activeAssistant.swipes : null;
-            const isLatestOrOnlySwipe = !swipes || parsedActive.swipeId >= swipes.length - 1;
-            if (isLatestOrOnlySwipe && !isManualLinkedUserText(activeAssistant, parsedActive.swipeId)) {
-                clearUserBubbleHighlightForActiveKey();
-                return;
-            }
-        }
-
-        const userText = getLinkedTextByKey(activeKey);
-        if (userText == null) {
-            clearUserBubbleHighlightForActiveKey();
-            return;
-        }
-
-        const m = /^([0-9]+):([0-9]+)$/.exec(activeKey);
-        if (!m) {
-            clearAnySwipeLinkedHighlight();
-            return;
-        }
-        const assistantMesId = Number(m[1]);
-        const assistantChatIndex = findChatIndexByMesId(assistantMesId);
-        if (assistantChatIndex == null) {
-            log('Could not resolve assistant chat index for mesid', assistantMesId);
-            clearAnySwipeLinkedHighlight();
-            return;
-        }
-        const userIndex = getUserIndexBefore(assistantChatIndex);
-        if (userIndex == null) {
-            clearAnySwipeLinkedHighlight();
-            return;
-        }
-
-        const userEl = getMesElForChatIndex(userIndex);
-        if (!userEl) {
-            log('Could not resolve exact user message DOM element for index', userIndex);
-            clearAnySwipeLinkedHighlight();
-            return;
-        }
-        clearSwipeLinkedHighlightsExcept(userEl);
-        const textEl = getMesTextEl(userEl);
-        if (!textEl) {
-            clearAnySwipeLinkedHighlight();
-            return;
-        }
-
-        // Compare stored text against the canonical user message in chat data.
-        // Only highlight if the text was actually modified for this swipe variant.
-        const chat = SillyTavern.getContext().chat;
-        const originalUserText = chat && chat[userIndex] ? getUserDisplayText(chat[userIndex]) : null;
-        if (originalUserText != null && userText.trim() === originalUserText.trim()) {
-            // Text wasn't modified – restore formatted DOM and don't highlight
-            restoreUserBubbleFromChat(userEl);
-            userEl.removeAttribute('data-swipe-linked');
-            return;
-        }
-
-        if (textEl.textContent.trim() === userText.trim()) {
-            userEl.setAttribute('data-swipe-linked', '1');
-            return;
-        }
-
-        log('Updating user bubble to:', userText.substring(0, 60));
-        textEl.innerHTML = formatUserMessageText(userText, userIndex);
-        userEl.setAttribute('data-swipe-linked', '1');
     }
 
     function refreshActiveKeyFromChat(assistantIndexOrMesId = null) {
@@ -1250,31 +1256,19 @@
     // ─── Swipe Detection & Handling ──────────────────────────────────────────────
 
     function handleSwipeChange() {
-        refreshActiveKeyFromChat();
-        if (!activeKey) {
-            clearAnySwipeLinkedHighlight();
-            return;
-        }
-        if (!hasLinkedTextByKey(activeKey)) {
-            log('No mapping for key', activeKey);
-            clearUserBubbleHighlightForActiveKey();
-            return;
-        }
-        updateUserBubbleForActiveKey();
+        handleSwipeChangeForAssistant(null);
     }
 
     function handleSwipeChangeForAssistant(assistantIndexOrMesId = null) {
-        refreshActiveKeyFromChat(assistantIndexOrMesId);
-        if (!activeKey) {
-            clearAnySwipeLinkedHighlight();
-            return;
+        // Only the latest reply can be swiped, regenerated or continued, so only
+        // it may move the generation source. Older replies (popup overrides,
+        // linked-text deletions) just re-render.
+        const lastIdx = getLastAssistantIndexFromChat();
+        const targetIdx = assistantIndexOrMesId != null ? findChatIndexByMesId(assistantIndexOrMesId) : lastIdx;
+        if (targetIdx != null && targetIdx === lastIdx) {
+            refreshActiveKeyFromChat(getMesIdFromChatIndex(targetIdx));
         }
-        if (!hasLinkedTextByKey(activeKey)) {
-            log('No mapping for key', activeKey);
-            clearAnySwipeLinkedHighlight();
-            return;
-        }
-        updateUserBubbleForActiveKey();
+        syncAllUserBubbles();
     }
 
     function scheduleSwipeCheck(assistantIndexOrMesId = null) {
@@ -1868,7 +1862,7 @@
         if (!assistantIndexes.length) {
             activeKey = null;
             pendingNormalUserText = editedText;
-            clearAnySwipeLinkedHighlight();
+            syncAllUserBubbles();
             log('MESSAGE_EDITED – user has no assistant in turn; updated pending normal text:', editedText.substring(0, 60));
             return;
         }
@@ -1896,7 +1890,6 @@
 
     function onMessageDeleted(_chatLength) {
         invalidateMesElCache();
-        clearAnySwipeLinkedHighlight();
         removeDeleteMenu();
         pruneDeletionHistory();
 
@@ -2002,12 +1995,7 @@
         }
         pruneDeletionHistory();
 
-        refreshActiveKeyFromChat(assistantMesId);
-        if (!activeKey || !hasLinkedTextByKey(activeKey)) {
-            clearUserBubbleHighlightForAssistant(assistantMesId);
-            return;
-        }
-        updateUserBubbleForActiveKey();
+        handleSwipeChangeForAssistant(assistantMesId);
     }
 
     function onMessageSent(messageIndex) {
@@ -2029,7 +2017,9 @@
         pendingNormalUserText = typeof sentUserText === 'string' ? sentUserText : null;
         abandonPendingEditCleanup();
         activeKey = null;
-        clearAnySwipeLinkedHighlight();
+        // The replies above keep their selected swipes, so earlier bubbles keep
+        // showing what the prompt will send for them.
+        syncAllUserBubbles();
         log('MESSAGE_SENT – pending normal text:', pendingNormalUserText && pendingNormalUserText.substring(0, 60));
 
         // Preserve mappings so follow-up assistant generations can patch historical context.
@@ -2133,34 +2123,30 @@
     }
 
     /**
-     * Patch every historical user turn that sits before an assistant message parked
-     * on a NON-latest swipe, replacing its outgoing text with that swipe's linked
-     * user text. Used for `normal` sends, where the per-source-turn patch below does
-     * not run: without this, an earlier turn the user has swiped away from would be
-     * sent to the model as its latest-edited text rather than the branch's own text.
+     * Patch every historical user turn whose reply sits on a swipe that sends
+     * something other than the canonical text (see resolveSelectedSwipeUserText):
+     * a pending edit, a manual override, or a non-latest swipe's link. Without
+     * this, an earlier turn the user has swiped away from would be sent as its
+     * latest-edited text rather than the branch's own text. Runs for every
+     * generation type (quiet/impersonate prompts must see the same history the
+     * chat shows); swipe-like types then re-patch their source turn. Only
+     * tracked generations consume a pending edit.
      *
      * Operates directly on the spread-copied coreChat entries (which carry
-     * swipe_info/swipe_id/swipes), so no live-chat matching is needed. Only
-     * non-latest swipes are touched — the latest swipe equals canonical by
-     * construction. The replacement text is re-run through SillyTavern's prompt
-     * preprocessing so it matches the surrounding entries.
+     * swipe_info/swipe_id/swipes), so no live-chat matching is needed. The
+     * replacement text is re-run through SillyTavern's prompt preprocessing so
+     * it matches the surrounding entries.
      */
     async function patchHistoricalUserTurns(chat, interceptorType) {
         if (!Array.isArray(chat)) return;
         for (let i = 0; i < chat.length; i++) {
             const aiMsg = chat[i];
             if (!aiMsg || aiMsg.is_user || aiMsg.is_system) continue;
-            const swipes = Array.isArray(aiMsg.swipes) ? aiMsg.swipes : null;
             const swipeId = getSwipeIdFromMsg(aiMsg);
             const pendingEdit = findPendingEditForCoreAssistant(aiMsg, swipeId);
-            const isPendingEditedSwipe = Boolean(pendingEdit);
-            // A latest automatic link may be stale after a later canonical edit
-            // (especially across reload), so normal sends leave it canonical.
-            // A manual user-pinned link remains authoritative everywhere.
-            const isLatestOrOnlySwipe = !swipes || swipeId >= swipes.length - 1;
-            if (!isPendingEditedSwipe && isLatestOrOnlySwipe && !isManualLinkedUserText(aiMsg, swipeId)) continue;
-            const linked = isPendingEditedSwipe ? pendingEdit.text : getLinkedUserText(aiMsg, swipeId);
-            if (typeof linked !== 'string') continue;
+            const resolved = resolveSelectedSwipeUserText(aiMsg, pendingEdit);
+            if (!resolved) continue;
+            const linked = resolved.text;
             let userIdx = -1;
             for (let j = i - 1; j >= 0; j--) {
                 if (chat[j]?.is_user) { userIdx = j; break; }
@@ -2168,20 +2154,19 @@
             if (userIdx === -1) continue;
             const userMsg = chat[userIdx];
             if (!userMsg || typeof userMsg !== 'object') continue;
-            if (pendingEdit) markPendingEditUsed(pendingEdit.key);
+            if (pendingEdit && shouldTrackGenerationType(interceptorType)) markPendingEditUsed(pendingEdit.key);
             const processed = await reprocessUserTextForPrompt(chat, userMsg, linked, interceptorType);
             if (userMsg.mes === processed) continue;
             userMsg.mes = processed;
-            log('Interceptor (normal) patched historical user idx', userIdx, 'for assistant idx', i, 'swipe', swipeId, 'to:', linked.substring(0, 60));
+            log(`Interceptor (${interceptorType}) patched historical user idx`, userIdx, 'for assistant idx', i, 'swipe', swipeId, 'to:', linked.substring(0, 60));
         }
     }
 
     exposeOwnedGlobal('swipeLinkedUserEditInterceptor', async function (chat, _contextSize, _abort, _type) {
         const interceptorType = normalizeGenerationEventType(_type);
-        if (interceptorType === 'normal') {
-            await patchHistoricalUserTurns(chat, interceptorType);
-            return;
-        }
+        // Earlier turns must read the same whatever produces the next reply;
+        // swipe-like types then patch their source turn below, which wins.
+        await patchHistoricalUserTurns(chat, interceptorType);
         if (interceptorType !== 'swipe' && interceptorType !== 'regenerate' && interceptorType !== 'continue') return;
 
         const skipPatch = (reason, details = {}) => {
@@ -2405,6 +2390,8 @@
     function onMoreMessagesLoaded() {
         invalidateMesElCache();
         scheduleEditsButtonsForLoadedChat();
+        // Older rows arrive rendered with their canonical text.
+        scheduleSwipeRenderAfterFrame(null, { skipWhileGenerating: true });
     }
 
     function ensureEditsButtonForAssistant(assistantIndexOrMesId) {
@@ -3458,26 +3445,13 @@
         }
 
         if (mesEl.getAttribute('data-swipe-linked') === '1') {
-            const assistantIndexes = [];
-            for (let i = chatIndex + 1; i < chat.length; i++) {
-                const candidate = chat[i];
-                if (!candidate) continue;
-                if (candidate.is_user) break;
-                if (!candidate.is_system && hasAssistantContent(candidate)) assistantIndexes.push(i);
-            }
-            if (!assistantIndexes.length) return null;
-            let assistantIndex = assistantIndexes[assistantIndexes.length - 1];
-            const activeAssistantMesId = parseMappingKey(activeKey)?.assistantMesId ?? null;
-            if (activeAssistantMesId != null) {
-                const activeIdx = findChatIndexByMesId(activeAssistantMesId);
-                if (assistantIndexes.includes(activeIdx)) assistantIndex = activeIdx;
-            }
-            const aiMsg = chat[assistantIndex];
-            const assistantMesId = getMesIdFromChatIndex(assistantIndex);
-            const swipeId = resolveSwipeId(assistantMesId, aiMsg);
-            const linkedText = getLinkedUserText(aiMsg, swipeId);
-            if (typeof linkedText !== 'string') return null;
-            return { ...base, kind: 'linked', source: linkedText, aiMsg, assistantMesId, swipeId };
+            // Edit the swipe link that decided this bubble (the same rule that
+            // rendered it and that the prompt uses).
+            const resolved = resolveTurnUserText(chatIndex);
+            if (!resolved || resolved.source === 'edited') return null;
+            const aiMsg = chat[resolved.assistantIndex];
+            const assistantMesId = getMesIdFromChatIndex(resolved.assistantIndex);
+            return { ...base, kind: 'linked', source: resolved.text, aiMsg, assistantMesId, swipeId: resolved.swipeId };
         }
 
         if (typeof msg.extra?.display_text === 'string') return null;
