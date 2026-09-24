@@ -34,6 +34,113 @@ test('a pending pencil edit remains displayed for its selected swipe', async () 
     assert.equal(userElement.hasAttribute('data-swipe-linked'), false);
 });
 
+test('swiping away releases a pending edit so the older swipe shows its own text again', async () => {
+    // A branch keeps the swipe that was on screen, so the user can land on an
+    // older variant. Editing there and browsing to the next existing variant
+    // and back must not leave the edit pinned to a reply it did not produce.
+    const assistant = {
+        is_user: false,
+        mes: 'reply A',
+        send_date: 'assistant-1',
+        swipe_id: 0,
+        swipes: ['reply A', 'reply B'],
+        swipe_info: [
+            { extra: { linked_user_text: 'original' } },
+            { extra: { linked_user_text: 'original' } },
+        ],
+        extra: { linked_user_text: 'original' },
+    };
+    const chat = [
+        { is_user: true, mes: 'original', send_date: 'user-1' },
+        assistant,
+    ];
+    const userElement = createMessageElement(0, { isUser: true, text: 'original' });
+    const assistantElement = createMessageElement(1, { text: 'reply A' });
+    const harness = createHarness(chat, [userElement, assistantElement]);
+    harness.runTimers();
+    const swipeTo = async (swipeId) => {
+        assistant.swipe_id = swipeId;
+        assistant.mes = assistant.swipes[swipeId];
+        assistant.extra = { ...assistant.swipe_info[swipeId].extra };
+        assistantElement.setAttribute('swipeid', String(swipeId));
+        await harness.eventSource.emit(harness.eventTypes.MESSAGE_SWIPED, 1);
+        harness.runTimers();
+    };
+
+    chat[0].mes = 'pencil edit';
+    userElement.mesText.innerHTML = 'pencil edit';
+    await harness.eventSource.emit(harness.eventTypes.MESSAGE_EDITED, 0);
+    await harness.eventSource.emit(harness.eventTypes.MESSAGE_UPDATED, 0);
+    harness.runTimers();
+    assert.equal(userElement.mesText.textContent, 'pencil edit');
+
+    await swipeTo(1);
+    // The latest swipe keeps showing the canonical edit for the next regeneration.
+    assert.equal(userElement.mesText.textContent, 'pencil edit');
+
+    await swipeTo(0);
+    assert.equal(userElement.mesText.textContent, 'original');
+    assert.equal(userElement.getAttribute('data-swipe-linked'), '1');
+    assert.equal(harness.hooks().getState().pendingEditedEntry, null);
+
+    // The prompt follows the display: continuing from the older swipe sends its text.
+    chat.push({ is_user: true, mes: 'follow-up', send_date: 'user-2' });
+    await harness.eventSource.emit(harness.eventTypes.MESSAGE_SENT, 2);
+    await harness.eventSource.emit(harness.eventTypes.GENERATION_STARTED, 'normal', {}, false);
+    await harness.eventSource.emit(harness.eventTypes.GENERATION_AFTER_COMMANDS, 'normal', {}, false);
+    const coreChat = chat.map((message, index) => ({ ...message, index }));
+    await harness.sandbox.swipeLinkedUserEditInterceptor(coreChat, 4096, () => {}, 'normal');
+    assert.equal(coreChat[0].mes, 'original');
+});
+
+test('regenerating after swiping away from the edited swipe still uses the edit', async () => {
+    const assistant = {
+        is_user: false,
+        mes: 'reply A',
+        send_date: 'assistant-1',
+        swipe_id: 0,
+        swipes: ['reply A', 'reply B'],
+        swipe_info: [
+            { send_date: 'assistant-1', extra: { linked_user_text: 'original' } },
+            { send_date: 'assistant-1b', extra: { linked_user_text: 'original' } },
+        ],
+        extra: { linked_user_text: 'original' },
+    };
+    const chat = [
+        { is_user: true, mes: 'original', send_date: 'user-1' },
+        assistant,
+    ];
+    const harness = createHarness(chat);
+    harness.runTimers();
+
+    chat[0].mes = 'pencil edit';
+    await harness.eventSource.emit(harness.eventTypes.MESSAGE_EDITED, 0);
+
+    // Browse to the latest existing swipe, then overswipe to generate.
+    assistant.swipe_id = 1;
+    assistant.mes = 'reply B';
+    await harness.eventSource.emit(harness.eventTypes.MESSAGE_SWIPED, 1);
+    assistant.swipe_id = 2;
+    await harness.eventSource.emit(harness.eventTypes.MESSAGE_SWIPED, 1);
+    await harness.eventSource.emit(harness.eventTypes.GENERATION_STARTED, 'swipe', {}, false);
+    await harness.eventSource.emit(harness.eventTypes.GENERATION_AFTER_COMMANDS, 'swipe', {}, false);
+
+    const coreChat = [{ ...chat[0], index: 0 }];
+    await harness.sandbox.swipeLinkedUserEditInterceptor(coreChat, 4096, () => {}, 'swipe');
+    assert.equal(coreChat[0].mes, 'pencil edit');
+
+    assistant.swipes.push('reply C');
+    assistant.swipe_info.push({ send_date: 'assistant-1c', extra: { linked_user_text: 'original' } });
+    assistant.mes = 'reply C';
+    await harness.eventSource.emit(harness.eventTypes.MESSAGE_RECEIVED, 1, 'swipe');
+    await harness.eventSource.emit(harness.eventTypes.GENERATION_ENDED);
+    harness.runTimers();
+    assert.deepEqual(
+        assistant.swipe_info.map((info) => info.extra.linked_user_text),
+        ['original', 'original', 'pencil edit'],
+    );
+});
+
 test('reload keeps canonical text visible for a latest automatic link', () => {
     const chat = [
         { is_user: true, mes: 'pencil edit', send_date: 'user-1' },

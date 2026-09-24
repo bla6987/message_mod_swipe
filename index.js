@@ -139,6 +139,23 @@
         }
     }
 
+    /**
+     * A pencil edit holds the swipe that was on screen when it was made only
+     * until the user browses to another existing variant. Otherwise swiping away
+     * and back (e.g. after branching onto an older swipe) would keep showing and
+     * sending the edit for a reply that was generated from the earlier text. The
+     * edit remains the canonical message text, which the latest swipe and the
+     * next regeneration still use.
+     */
+    function releasePendingEditsForOtherSwipes(assistantMesId, swipeId) {
+        for (const entry of Array.from(pendingEditedEntries.values())) {
+            const parsed = parseMappingKey(entry.key);
+            if (!parsed || parsed.assistantMesId !== assistantMesId || parsed.swipeId === swipeId) continue;
+            deletePendingEditedEntry(entry.key);
+            log('Released pending edit after swiping away from', entry.key);
+        }
+    }
+
     function clearConsumedPendingEdits() {
         for (const key of pendingEditKeysUsedForGeneration) {
             pendingEditedEntries.delete(key);
@@ -1802,9 +1819,11 @@
         } else {
             // Ordinary swipe between existing variants: sync activeKey to the
             // swiped assistant's current swipe right away for the same reason.
-            activeKey = `${assistantMesId}:${resolveSwipeId(assistantMesId, aiMsg)}`;
+            const swipeId = resolveSwipeId(assistantMesId, aiMsg);
+            activeKey = `${assistantMesId}:${swipeId}`;
             if (!isGenerating) {
                 pendingSwipeGenerationKey = null;
+                releasePendingEditsForOtherSwipes(assistantMesId, swipeId);
             }
         }
 

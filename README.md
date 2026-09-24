@@ -50,6 +50,12 @@ If you pencil-edit the message again after generating the latest swipe, that
 new canonical edit remains displayed and is used on the next normal send until
 you regenerate. Earlier selected swipes continue to use their linked text.
 
+An edit made while an older swipe is on screen (for example right after
+branching, which keeps the swipe you were viewing) applies to that swipe only
+until you swipe to another variant. After that, every older swipe shows and
+sends the text it was generated from again; the edit stays the message's
+current text, so the latest swipe and the next regeneration still use it.
+
 ### View linked edits
 
 AI messages that have more than one swipe (or any recorded edit) get a small
